@@ -1087,7 +1087,19 @@ function handlePanelMessage(message) {
         showManualBanner(state.target.currentText);
       } else {
         hideManualBanner();
-        state.targetPhase = state.target.pluginOwned ? "synced" : "empty";
+        // Plugin-owned text is only "synced" when it matches the English for
+        // the current Chinese revision. A rebind must not flip stale content
+        // back to a green 已同步 badge, and a stale target regains its
+        // scheduled auto-clear that the rebind's abortInFlight cancelled.
+        const englishCurrent = Boolean(state.draft.english)
+          && state.draft.englishSourceRevision === state.sourceRevision
+          && normalizeText(state.target.currentText) === normalizeText(state.draft.english);
+        state.targetPhase = state.target.pluginOwned
+          ? (englishCurrent ? "synced" : (state.target.currentText ? "stale-uncleared" : "empty"))
+          : "empty";
+        if (state.targetPhase === "stale-uncleared" && state.settings.clearStaleTarget) {
+          scheduleStaleTargetClear();
+        }
         setStatus(state.target.composerReady ? "Claude 输入框已绑定" : "已绑定，但尚未找到输入框", "idle");
       }
       updateTargetUI();
@@ -1224,6 +1236,12 @@ function handlePanelMessage(message) {
       state.target.bound = false;
       state.target.connected = false;
       state.target.active = false;
+      // Without these resets a closed tab leaves ghost "plugin owns target"
+      // state: 清空草稿 then takes the stale-target branch and shows a false
+      // "Claude 中仍可能保留旧英文" banner for a tab that no longer exists.
+      state.target.composerReady = false;
+      state.target.pluginOwned = false;
+      state.target.strategy = null;
       state.targetPhase = "unbound";
       if (message.type === "TARGET_TAKEN" || !message.recoverable) {
         state.target.tabId = null;
@@ -1487,6 +1505,11 @@ async function translateNow({ forceSync = false, forceOverwrite = false, reason 
 
   state.mainController?.abort();
   state.backController?.abort();
+  state.backController = null;
+  // A directly aborted independent back-translation exits through its
+  // AbortError guard without reaching a terminal phase; reset it here the
+  // same way abortInFlight() does so the badge cannot stick on 等待回译.
+  if (["waiting", "working"].includes(state.backPhase)) state.backPhase = "idle";
   const controller = new AbortController();
   state.mainController = controller;
   const operationEpoch = ++state.operationEpoch;
@@ -1718,7 +1741,19 @@ async function syncEnglishNow({
     }
   }
   if (!operationIsCurrent() || !revisionIsCurrent()) return false;
-  if ((state.targetPhase === "manual" || state.paused) && !forceOverwrite) return false;
+  if ((state.targetPhase === "manual" || state.paused) && !forceOverwrite) {
+    // Never drop an explicit sync silently: without a status update the
+    // 同步 button appears dead while paused, and the off-back-translation
+    // flow would leave "正在准备同步…" on screen forever.
+    setStatus(
+      state.paused
+        ? "已暂停：英文未写入 Claude，按 Esc 或“恢复”后可同步"
+        : "Claude 输入框处于人工修改状态；请先在横幅中选择处理方式",
+      "paused"
+    );
+    updateDraftUI();
+    return false;
+  }
   if (!targetContextMatches(initialIdentity, state.target)) {
     state.targetPhase = "preview-only";
     setStatus("清理旧译文期间 Claude 目标已变化；本次仅保留预览", "paused");
@@ -2300,6 +2335,11 @@ function fillSettingsForm() {
 }
 
 function openSettings() {
+  // A re-entrant call while the dialog is already open (e.g. a debounce-fired
+  // translateNow hitting a missing-config path) must not reset the form the
+  // user is editing, abort their in-flight detect/test request, or throw
+  // InvalidStateError from showModal().
+  if (ui.settingsDialog.open) return;
   invalidateFormRequests();
   state.externalConfigurationChanged = false;
   fillSettingsForm();
