@@ -1563,3 +1563,62 @@ test("bounds and sanitizes persisted draft, history, and diagnostics state", () 
   assert.equal(diagnostics[0].message.length, 240);
   assert.ok(diagnostics.every((item) => Number.isFinite(item.timestamp)));
 });
+
+test("rejects Base URLs carrying an empty query or fragment separator", () => {
+  // "https://x/v1?" reports url.search === "" but serializes back with the
+  // bare "?", which would push the endpoint path into the query string.
+  assert.throws(() => normalizeBaseUrl("https://api.example.com/v1?"), /查询参数/);
+  assert.throws(() => normalizeBaseUrl("https://api.example.com/v1#"), /查询参数/);
+  assert.throws(() => normalizeBaseUrl("https://api.example.com/v1?x=1"), /查询参数/);
+});
+
+test("rejects header values, prefixes and keys that fetch cannot serialize", () => {
+  assert.deepEqual(
+    sanitizeExtraHeaders({ "X-Route": "中文路由", "X-Ok": "café" }),
+    { "X-Ok": "café" }
+  );
+  assert.throws(
+    () => buildHeaders({ authHeader: "Authorization", authPrefix: "令牌" }, "secret"),
+    /Latin-1/
+  );
+  assert.throws(
+    () => buildHeaders({ authHeader: "Authorization", authPrefix: "Bearer" }, "秘密"),
+    /Latin-1/
+  );
+});
+
+test("classifies an oversized error body by HTTP status instead of body size", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("x".repeat(140_000), {
+    status: 429,
+    headers: { "Retry-After": "7" }
+  });
+  try {
+    await assert.rejects(
+      chatCompletion({
+        config: {
+          baseUrl: "https://provider.example/v1",
+          timeoutMs: 1000,
+          capabilities: { jsonMode: false, temperature: false }
+        },
+        apiKey: "test-key",
+        model: "model",
+        messages: [{ role: "user", content: "hello" }]
+      }),
+      (error) => error?.code === "rate_limited" && error?.retryAfterMs === 7000
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("provider credential binding orders headers by code units, not locale", () => {
+  const binding = providerCredentialBinding({
+    baseUrl: "https://api.example.com/v1",
+    extraHeaders: { X_A: "3", "X-B": "1", "X-A": "2" }
+  });
+  const parsed = JSON.parse(binding);
+  // "-" (0x2D) sorts before "_" (0x5F) in code units; ICU collation would
+  // interleave them and could change across browser/locale updates.
+  assert.deepEqual(parsed.extraHeaders.map(([name]) => name), ["x-a", "x-b", "x_a"]);
+});

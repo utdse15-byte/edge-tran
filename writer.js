@@ -4,6 +4,8 @@
   const SEND_INTENT_TTL_MS = 3000;
   const REBIND_DELAY_MS = 80;
   const PORT_RECONNECT_DELAY_MS = 450;
+  const HIDDEN_COMPOSER_GRACE_MS = 5000;
+  const TEXT_CONTROL_POLL_MS = 500;
   const EDITABLE_SELECTOR = [
     "textarea",
     'input[type="text"]',
@@ -39,6 +41,8 @@
   let preferredStrategy = null;
   let activeMutation = null;
   let mutationQueue = Promise.resolve();
+  let hiddenComposerSince = 0;
+  let textControlPollTimer = null;
 
   function randomId(prefix) {
     const bytes = new Uint8Array(10);
@@ -259,6 +263,19 @@
         .trim();
       if (hasMeaningfulText || hasMeaningfulDescendant || label) return node;
     }
+
+    // Attachment chips are often rendered as siblings of the editor inside the
+    // same input container, not inside the contenteditable itself. Only
+    // unambiguous attachment markers are checked here: generic selectors such
+    // as img/button would match ordinary toolbar controls and permanently
+    // disable automatic writes.
+    let scope = element.parentElement;
+    for (let depth = 0; scope && depth < 3; depth += 1) {
+      for (const node of scope.querySelectorAll('[data-attachment], [data-file-id], [data-testid*="attachment" i]')) {
+        if (!element.contains(node)) return node;
+      }
+      scope = scope.parentElement;
+    }
     return null;
   }
 
@@ -385,7 +402,10 @@
     lastObservedText = current;
 
     if (performance.now() < suppressUntil && current === normalizeText(expectedWriteText)) return;
-    if (!trusted && current === normalizeText(expectedWriteText)) return;
+    // Outside the timed window, only a non-empty expected value may suppress an
+    // untrusted echo. An empty expectation left behind by a failed clear must
+    // never swallow a page-side clear (a real send) indefinitely.
+    if (!trusted && normalizeText(expectedWriteText) && current === normalizeText(expectedWriteText)) return;
 
     if (!current && previous) {
       confirmClear(previous);
@@ -406,6 +426,14 @@
       event.isTrusted
       && sendIntent?.kind === "keyboard"
       && ["insertParagraph", "insertLineBreak"].includes(String(event.inputType || ""))
+    ) clearSendIntent();
+    // A trusted deletion or undo after a plain Enter means the Enter did not
+    // send. Without this, an ineffective Enter followed by a manual select-all
+    // delete within the intent TTL is archived as a confirmed send.
+    if (
+      event.isTrusted
+      && sendIntent?.kind === "keyboard"
+      && (/^delete/.test(String(event.inputType || "")) || String(event.inputType || "") === "historyUndo")
     ) clearSendIntent();
 
     if (activeMutation?.element === composer && event.isTrusted) {
@@ -438,7 +466,10 @@
     const label = sendLabelFor(button);
     const composerForm = composer?.closest("form");
     const sameForm = Boolean(composerForm && composerForm === button.closest("form"));
-    if (button.type === "submit" && sameForm) return true;
+    // Implicit type="submit" alone is not enough: untyped toolbar buttons
+    // (attach, mic, model picker) default to submit and must not record a
+    // send intent. Real form submissions are still caught by the document
+    // submit listener even when the button label never matches.
     if (!/(send|发送|提交|submit)/i.test(label)) return false;
     if (sameForm) return true;
 
@@ -461,6 +492,18 @@
     if (buttonLooksLikeSend(button)) recordSendIntent("button");
   }
 
+  function handleDocumentKeydown(event) {
+    // Capture at document level: a listener registered on the composer itself
+    // runs in the at-target phase after the page editor's own (earlier
+    // registered) handlers, which may have already cleared the document and
+    // made the send intent unrecordable. Document capture genuinely precedes
+    // at-target listeners.
+    if (!attached || !composer) return;
+    const target = event.target;
+    if (!(target instanceof Node) || (target !== composer && !composer.contains(target))) return;
+    handleComposerKeydown(event);
+  }
+
   function handleDocumentSubmit(event) {
     if (!attached || !event.isTrusted || !composer) return;
     const form = event.target instanceof HTMLFormElement ? event.target : null;
@@ -478,7 +521,19 @@
   function observeComposerMutations() {
     composerObserver?.disconnect();
     composerObserver = null;
-    if (!composer || isTextControl(composer)) return;
+    if (textControlPollTimer !== null) clearInterval(textControlPollTimer);
+    textControlPollTimer = null;
+    if (!composer) return;
+    if (isTextControl(composer)) {
+      // Programmatic value assignments emit neither input events nor DOM
+      // mutations. Poll so a page-side clear (a send) on a text-control
+      // composer is still observed and the draft can be archived.
+      textControlPollTimer = setInterval(() => {
+        if (!attached || !composer || !isTextControl(composer)) return;
+        reconcileComposerText({ trusted: false });
+      }, TEXT_CONTROL_POLL_MS);
+      return;
+    }
     composerObserver = new MutationObserver(scheduleComposerReconcile);
     composerObserver.observe(composer, {
       childList: true,
@@ -490,10 +545,11 @@
   function removeComposerListeners() {
     if (composer) {
       composer.removeEventListener("input", handleComposerInput, true);
-      composer.removeEventListener("keydown", handleComposerKeydown, true);
     }
     composerObserver?.disconnect();
     composerObserver = null;
+    if (textControlPollTimer !== null) clearInterval(textControlPollTimer);
+    textControlPollTimer = null;
     if (reconcileTimer !== null) clearTimeout(reconcileTimer);
     reconcileTimer = null;
   }
@@ -520,6 +576,12 @@
     const previouslyOwned = Object.hasOwn(options, "previouslyOwned")
       ? Boolean(options.previouslyOwned)
       : pluginOwned;
+    // A navigation caller resets lastWritten before rebinding; without the
+    // pre-reset value the re-own comparison below always fails and plugin
+    // text is misclassified as manual content after every SPA navigation.
+    const previousLastWritten = Object.hasOwn(options, "previousLastWritten")
+      ? normalizeText(options.previousLastWritten)
+      : normalizeText(lastWritten);
     // Capture a valid send intent before changing targetEpoch. Claude may
     // replace the composer node after a successful send without changing the
     // URL; validating only after the rebind would incorrectly invalidate the
@@ -534,6 +596,7 @@
     invalidateActiveMutation();
     removeComposerListeners();
     composer = nextComposer;
+    hiddenComposerSince = 0;
 
     if (previousComposer && previousComposer !== nextComposer) {
       targetEpoch += 1;
@@ -548,7 +611,6 @@
     }
 
     composer.addEventListener("input", handleComposerInput, true);
-    composer.addEventListener("keydown", handleComposerKeydown, true);
     observeComposerMutations();
     const current = readComposerText();
     lastObservedText = current;
@@ -559,7 +621,8 @@
       // trusted intent captured above matches; otherwise report an external
       // clear so the Chinese source is preserved and automatic sync pauses.
       confirmClear(previousText, replacementSendIntent);
-    } else if (previouslyOwned && current === normalizeText(lastWritten)) {
+    } else if (previouslyOwned && current === previousLastWritten) {
+      lastWritten = previousLastWritten;
       pluginOwned = true;
       clearSendIntent();
     } else if (current !== normalizeText(lastWritten)) {
@@ -591,6 +654,7 @@
     if (location.href !== lastUrl) {
       const previousObservedText = lastObservedText;
       const wasPluginOwned = pluginOwned;
+      const previousLastWritten = lastWritten;
       const navigationSendIntent = validSendIntent()
         && normalizeText(sendIntent?.text) === normalizeText(previousObservedText)
         ? { ...sendIntent }
@@ -609,7 +673,8 @@
         bindComposer(nextComposer, "navigation_rebound", {
           previousText: previousObservedText,
           sendIntent: navigationSendIntent,
-          previouslyOwned: wasPluginOwned
+          previouslyOwned: wasPluginOwned,
+          previousLastWritten
         });
       } else {
         const currentAfterNavigation = readComposerText(nextComposer);
@@ -617,13 +682,41 @@
           confirmClear(previousObservedText, navigationSendIntent);
         } else {
           lastObservedText = currentAfterNavigation;
+          if (wasPluginOwned && currentAfterNavigation === normalizeText(previousLastWritten)) {
+            // The URL changed but the same composer kept the plugin's draft
+            // untouched; keep ownership instead of downgrading it to manual
+            // content that would require a force-overwrite to update.
+            lastWritten = normalizeText(previousLastWritten);
+            pluginOwned = true;
+          }
           clearSendIntent();
           sendState("navigation_same_composer");
         }
       }
     }
-    if (!composer?.isConnected || !isEditableCandidate(composer)) bindComposer(locateComposer(), "rebound");
-    else reconcileComposerText({ trusted: false });
+    if (!composer?.isConnected) {
+      hiddenComposerSince = 0;
+      bindComposer(locateComposer(), "rebound");
+    } else if (!isEditableCandidate(composer)) {
+      // A modal or overlay can hide the composer for a moment without touching
+      // the draft. Rebinding immediately would misreport the still-present
+      // text as an external clear — or bind an unrelated editor such as an
+      // inline message-edit box — so keep the binding briefly while the text
+      // is unchanged and re-check.
+      const now = performance.now();
+      if (readComposerText(composer) === lastObservedText) {
+        if (hiddenComposerSince === 0) hiddenComposerSince = now;
+        if (now - hiddenComposerSince < HIDDEN_COMPOSER_GRACE_MS) {
+          scheduleEnsureComposer();
+          return;
+        }
+      }
+      hiddenComposerSince = 0;
+      bindComposer(locateComposer(), "rebound");
+    } else {
+      hiddenComposerSince = 0;
+      reconcileComposerText({ trusted: false });
+    }
   }
 
   function scheduleEnsureComposer() {
@@ -681,6 +774,7 @@
     lease = attachLease;
     document.addEventListener("click", handleDocumentClick, true);
     document.addEventListener("submit", handleDocumentSubmit, true);
+    document.addEventListener("keydown", handleDocumentKeydown, true);
     window.addEventListener("popstate", scheduleEnsureComposer);
     window.addEventListener("hashchange", scheduleEnsureComposer);
     window.addEventListener("pageshow", scheduleEnsureComposer);
@@ -698,6 +792,7 @@
     composer = null;
     document.removeEventListener("click", handleDocumentClick, true);
     document.removeEventListener("submit", handleDocumentSubmit, true);
+    document.removeEventListener("keydown", handleDocumentKeydown, true);
     window.removeEventListener("popstate", scheduleEnsureComposer);
     window.removeEventListener("hashchange", scheduleEnsureComposer);
     window.removeEventListener("pageshow", scheduleEnsureComposer);
@@ -1136,6 +1231,14 @@
       );
     }
     if (pluginOwned && current !== normalizeText(lastWritten)) {
+      if (!current) {
+        // The composer emptied between a page-side clear (a send or a manual
+        // wipe) and the queued reconcile. Let the pending send intent decide
+        // between SEND_CONFIRMED and TARGET_CLEARED instead of destroying it
+        // as a zero-length "manual edit".
+        confirmClear(lastObservedText || normalizeText(lastWritten));
+        return rejectResult(resultType, message.requestId, "target_cleared", "写入前发现输入框已被清空，未执行写入");
+      }
       reportManualEdit(current);
       return rejectResult(resultType, message.requestId, "manual_edit", "检测到人工修改，未覆盖");
     }
@@ -1144,7 +1247,12 @@
     }
 
     const text = String(message.text ?? "");
-    clearSendIntent();
+    // Do not clear a just-recorded trusted send intent before the DOM is
+    // actually modified: a write that fails without touching the editor (e.g.
+    // focus_write_disabled) must not downgrade a real concurrent send to a
+    // plain external clear. The intent is cleared on success below.
+    const previousExpectedWriteText = expectedWriteText;
+    const previousSuppressUntil = suppressUntil;
     expectedWriteText = text;
     suppressUntil = performance.now() + 900;
     const operation = beginMutation(targetElement, current, text);
@@ -1200,6 +1308,11 @@
 
     const readback = readComposerText(targetElement);
     if (!writeResult?.ok || readback !== normalizeText(text)) {
+      if (writeResult?.code === "focus_write_disabled") {
+        // The DOM was never touched; restore the pre-attempt suppression state.
+        expectedWriteText = previousExpectedWriteText;
+        suppressUntil = previousSuppressUntil;
+      }
       return rejectResult(
         resultType,
         message.requestId,
@@ -1211,6 +1324,7 @@
       );
     }
 
+    clearSendIntent();
     preferredStrategy = writeResult.strategy;
     targetEpoch += 1;
     lastWritten = normalizeText(text);
@@ -1253,7 +1367,14 @@
       return rejectResult(resultType, message.requestId, "not_plugin_owned", "当前内容不是插件的最后写入值");
     }
 
-    clearSendIntent();
+    // Arm the self-echo suppression only for the duration of this attempt.
+    // Every failure path below must disarm (or restore) it: a leftover empty
+    // expectation would silently swallow a genuine user send, and clearing the
+    // send intent up front would downgrade a real send recorded milliseconds
+    // earlier. The intent is cleared only after the DOM was actually emptied
+    // by this operation.
+    const previousExpectedWriteText = expectedWriteText;
+    const previousSuppressUntil = suppressUntil;
     expectedWriteText = "";
     suppressUntil = performance.now() + 900;
     const operation = beginMutation(targetElement, current, "");
@@ -1267,6 +1388,8 @@
     }
 
     if (clearResult?.code === "write_failed_not_restored") {
+      expectedWriteText = "";
+      suppressUntil = 0;
       const dirtyText = readComposerText(targetElement);
       reportRecoveryFailure(dirtyText, "clear_recovery_failed");
       return rejectResult(
@@ -1279,6 +1402,8 @@
     }
 
     if (clearResult?.code === "write_interrupted" || operation.userInterference) {
+      expectedWriteText = "";
+      suppressUntil = 0;
       const interruptedText = readComposerText(targetElement);
       reportManualEdit(interruptedText, "clear_interrupted");
       return rejectResult(
@@ -1298,6 +1423,8 @@
       || !targetElement.isConnected
       || operation.invalidated
     ) {
+      expectedWriteText = "";
+      suppressUntil = 0;
       return rejectResult(
         resultType,
         message.requestId,
@@ -1308,6 +1435,11 @@
     }
 
     if (!clearResult?.ok || readComposerText(targetElement) !== "") {
+      // The DOM was not modified (e.g. focus_write_disabled) or still holds
+      // text; restore the pre-attempt suppression state so the old draft's
+      // eventual real send is reported normally.
+      expectedWriteText = previousExpectedWriteText;
+      suppressUntil = previousSuppressUntil;
       return rejectResult(
         resultType,
         message.requestId,
@@ -1319,6 +1451,7 @@
       );
     }
 
+    clearSendIntent();
     targetEpoch += 1;
     lastWritten = "";
     lastObservedText = "";
@@ -1518,5 +1651,12 @@
     });
   }
 
-  connectPort();
+  if (document.prerendering) {
+    // A prerendered document must not compete for the per-tab writer slot:
+    // it would capture the lease and receive writes into an invisible
+    // composer. Connect only once this document becomes the active one.
+    document.addEventListener("prerenderingchange", () => connectPort(), { once: true });
+  } else {
+    connectPort();
+  }
 })();

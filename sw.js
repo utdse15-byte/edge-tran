@@ -14,11 +14,18 @@ function post(port, message) {
 }
 
 async function initializeExtension() {
-  await hardenStorageAccess();
   try {
     await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
   } catch {
     // Edge/Chrome versions without this behavior can still open from the sidebar menu.
+  }
+  try {
+    await hardenStorageAccess();
+  } catch {
+    // Fail closed downstream: the panel re-runs this hardening check during
+    // its own startup and disables itself with a visible error. The toolbar
+    // button must still be able to open that panel, and an unhandled
+    // rejection here must not be the only trace of the failure.
   }
 }
 
@@ -302,6 +309,17 @@ async function handlePanelMessage(panel, message) {
 }
 
 function registerPanel(port) {
+  // Only trusted extension pages (the side panel) may hold panel privileges.
+  // A port opened from a tab context — e.g. the content-script isolated
+  // world — must never be able to bind tabs or issue write commands.
+  if (port.sender?.tab) {
+    try {
+      port.disconnect();
+    } catch {
+      // Nothing to clean up for a rejected connection.
+    }
+    return;
+  }
   const panel = {
     port,
     windowId: null,
@@ -326,6 +344,18 @@ function registerWriter(port) {
   const tabId = port.sender?.tab?.id;
   if (!Number.isInteger(tabId)) {
     port.disconnect();
+    return;
+  }
+  // A prerendered or back/forward-cached document shares the tab id with the
+  // visible document. Letting it register would replace the live writer,
+  // inherit its lease, and route writes into an invisible composer.
+  const documentLifecycle = port.sender?.documentLifecycle;
+  if (typeof documentLifecycle === "string" && documentLifecycle !== "active") {
+    try {
+      port.disconnect();
+    } catch {
+      // Nothing to clean up for a rejected connection.
+    }
     return;
   }
 
@@ -428,4 +458,33 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     writer.ownerPanel.lease = null;
   }
   writers.delete(tabId);
+});
+
+// A bound tab dragged into another window keeps its writer port alive but
+// changes windows. Without following it, isBoundTabActive() would query the
+// old window forever and every write would fail as "not in the foreground".
+chrome.tabs.onAttached.addListener((tabId, attachInfo) => {
+  for (const panel of panels) {
+    if (panel.boundTabId === tabId && Number.isInteger(attachInfo?.newWindowId)) {
+      panel.windowId = attachInfo.newWindowId;
+    }
+  }
+});
+
+// Tab replacement (e.g. prerender activation into a new tab id) leaves the
+// old id dangling. Treat it like a close so the panel does not keep a dead
+// binding it can never write through.
+chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
+  const writer = writers.get(removedTabId);
+  if (writer?.ownerPanel) {
+    post(writer.ownerPanel.port, {
+      type: "TARGET_UNAVAILABLE",
+      tabId: removedTabId,
+      message: "已绑定的 Claude 标签页已被浏览器替换，请重新绑定"
+    });
+    writer.ownerPanel.boundTabId = null;
+    writer.ownerPanel.desiredTabId = null;
+    writer.ownerPanel.lease = null;
+  }
+  writers.delete(removedTabId);
 });

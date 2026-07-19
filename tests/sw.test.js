@@ -59,6 +59,8 @@ test("service worker transfers and recovers writer leases without losing the bou
   const tabs = {
     onActivated: new FakeEvent(),
     onRemoved: new FakeEvent(),
+    onAttached: new FakeEvent(),
+    onReplaced: new FakeEvent(),
     async get(tabId) {
       return { id: tabId, url: "https://claude.ai/chat/test", windowId: 9, active: true };
     },
@@ -173,6 +175,8 @@ test("service worker remembers a not-yet-ready target and rejects expired or sta
   const tabs = {
     onActivated: new FakeEvent(),
     onRemoved: new FakeEvent(),
+    onAttached: new FakeEvent(),
+    onReplaced: new FakeEvent(),
     async get(tabId) {
       const tab = tabRecords.get(tabId);
       if (!tab) throw new Error("missing tab");
@@ -316,6 +320,8 @@ test("service worker ignores a slow stale bind after a newer tab was selected", 
   const tabs = {
     onActivated: new FakeEvent(),
     onRemoved: new FakeEvent(),
+    onAttached: new FakeEvent(),
+    onReplaced: new FakeEvent(),
     async get(tabId) {
       if (tabId === 41) return slowTab;
       return { id: 42, url: "https://claude.ai/chat/two", windowId: 9, active: true };
@@ -384,6 +390,107 @@ test("service worker ignores a slow stale bind after a newer tab was selected", 
       "the late old bind must be dropped rather than rebinding the previous conversation"
     );
     assert.equal(writer41.last("ATTACH"), undefined);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker rejects prerendered writers and follows a tab moved between windows", async () => {
+  const originalChrome = globalThis.chrome;
+  const runtime = {
+    onInstalled: new FakeEvent(),
+    onStartup: new FakeEvent(),
+    onConnect: new FakeEvent()
+  };
+  const tab41 = { id: 41, url: "https://claude.ai/chat/one", windowId: 9, active: true };
+  const tabs = {
+    onActivated: new FakeEvent(),
+    onRemoved: new FakeEvent(),
+    onAttached: new FakeEvent(),
+    onReplaced: new FakeEvent(),
+    async get(tabId) {
+      if (tabId !== 41) throw new Error("missing tab");
+      return { ...tab41 };
+    },
+    async query({ windowId }) {
+      return tab41.windowId === windowId ? [{ ...tab41 }] : [];
+    }
+  };
+  const trustedStorage = {
+    async setAccessLevel() {},
+    async get() { return {}; },
+    async set() {},
+    async remove() {}
+  };
+  globalThis.chrome = {
+    runtime,
+    tabs,
+    windows: { async get(windowId) { return { id: windowId, focused: true }; } },
+    sidePanel: { async setPanelBehavior() {} },
+    storage: { local: trustedStorage, session: trustedStorage }
+  };
+
+  try {
+    await import(new URL(`../sw.js?test=${Date.now()}_lifecycle`, import.meta.url));
+    await nextTurn();
+
+    const panel = new FakePort("zh2en-panel");
+    runtime.onConnect.emit(panel);
+    panel.send({ type: "PANEL_HELLO", windowId: 9 });
+
+    const writer = new FakePort("zh2en-writer", {
+      tab: { id: 41 },
+      documentId: "doc-active",
+      documentLifecycle: "active"
+    });
+    runtime.onConnect.emit(writer);
+    writer.send({
+      type: "WRITER_HELLO",
+      writerSession: "writer-1",
+      state: { composerReady: true, currentText: "", targetEpoch: 0, pluginOwned: false }
+    });
+    panel.send({ type: "BIND_TAB", tabId: 41 });
+    await nextTurn();
+    assert.equal(panel.last("BIND_RESULT")?.ok, true);
+
+    // A prerendered document sharing the tab id must not capture the writer
+    // slot or inherit the live page's lease.
+    const prerender = new FakePort("zh2en-writer", {
+      tab: { id: 41 },
+      documentId: "doc-prerender",
+      documentLifecycle: "prerender"
+    });
+    runtime.onConnect.emit(prerender);
+    await nextTurn();
+    assert.equal(prerender.disconnected, true, "prerendered writers must be rejected");
+    assert.equal(writer.disconnected, false, "the live writer must keep its slot");
+
+    panel.send({ type: "GET_TARGET_TEXT", requestId: "before-move", deadline: Date.now() + 1000 });
+    await nextTurn();
+    assert.equal(writer.last("GET_TARGET_TEXT")?.requestId, "before-move");
+
+    // Dragging the bound tab into another window keeps commands flowing once
+    // onAttached updates the tracked window.
+    tab41.windowId = 12;
+    tabs.onAttached.emit(41, { newWindowId: 12, newPosition: 0 });
+    panel.send({ type: "GET_TARGET_TEXT", requestId: "after-move", deadline: Date.now() + 1000 });
+    await nextTurn();
+    assert.equal(
+      writer.last("GET_TARGET_TEXT")?.requestId,
+      "after-move",
+      "a tab moved between windows must stay writable"
+    );
+
+    // Tab replacement clears the binding instead of leaving a dead tab id.
+    tabs.onReplaced.emit(51, 41);
+    await nextTurn();
+    assert.equal(panel.last("TARGET_UNAVAILABLE")?.tabId, 41);
+    panel.send({ type: "GET_TARGET_TEXT", requestId: "after-replace", deadline: Date.now() + 1000 });
+    await nextTurn();
+    const afterReplace = panel.messages.findLast(
+      (message) => message.type === "GET_TARGET_TEXT_RESULT" && message.requestId === "after-replace"
+    );
+    assert.equal(afterReplace?.code, "target_unavailable");
   } finally {
     globalThis.chrome = originalChrome;
   }
