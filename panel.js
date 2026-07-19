@@ -872,22 +872,89 @@ function handleStorageChanges(changes, areaName) {
 
 function providerErrorMessage(error) {
   if (error instanceof TranslationValidationError) return error.message;
-  if (!(error instanceof ProviderError)) return error?.message || "翻译失败，请检查设置与网络";
-  switch (error.code) {
-    case "unauthorized": return "API Key、账户或模型权限无效";
-    case "rate_limited": return "Provider 正在限流";
-    case "timeout": return "Provider 请求超时";
-    case "network_error": return "无法连接 Provider";
-    case "endpoint_not_found": return "Base URL 或 Chat Completions 路径不正确";
-    case "model_not_found": return "模型不存在、不可用，或当前 API Key 无权访问";
-    case "incompatible_request": return "模型或网关不兼容当前请求格式，请运行连通测试";
-    case "payload_too_large": return "文本超过 Provider 限制";
-    case "output_truncated": return "模型输出被截断";
-    case "model_refusal": return "模型拒绝了本次翻译";
-    case "incomplete_response": return "模型没有返回完整的纯文本翻译";
-    case "response_too_large": return "Provider 返回内容异常过大，已安全终止";
-    default: return error.message || "Provider 请求失败";
+  if (!(error instanceof ProviderError)) {
+    return error?.message || "翻译失败，请检查设置与网络";
   }
+
+  switch (error.code) {
+    case "unauthorized":
+      return "API Key、账户或模型权限无效";
+    case "rate_limited":
+      return "Provider 正在限流";
+    case "timeout":
+      return "Provider 请求超时";
+    case "network_error":
+      return "无法连接 Provider";
+    case "endpoint_not_found":
+      return "Base URL 或 Chat Completions 路径不正确";
+    case "model_not_found":
+      return "模型不存在、不可用，或当前 API Key 无权访问";
+    case "incompatible_request":
+      return "模型或网关不兼容当前请求格式，请运行连通测试";
+    case "payload_too_large":
+      return "文本超过 Provider 限制";
+    case "output_truncated":
+      return "模型输出被截断";
+    case "model_refusal":
+      return "模型拒绝了本次翻译";
+    case "incomplete_response":
+      return "模型没有返回完整的纯文本翻译";
+    case "response_too_large":
+      return "Provider 返回内容异常过大，已安全终止";
+    case "empty_body":
+      return "Provider 返回 HTTP 成功状态，但响应体为空";
+    case "html_response":
+      return error.routeHint === "missing_api_prefix_likely"
+        ? "Provider 返回了网站 HTML，不是模型 JSON；Base URL 很可能缺少 API 前缀（常见为 /v1），或填成了网站首页"
+        : "Provider 返回了 HTML 网页，不是模型 JSON；请核对官方 API Base URL 与路由";
+    case "non_json_response":
+      return "Provider 返回了非 JSON 内容；请核对 API Base URL、代理与网关配置";
+    case "logical_api_error":
+      return "Provider 以 HTTP 200 返回了逻辑错误";
+    case "responses_api_response":
+      return "Provider 返回了 Responses API 结构；当前扩展配置要求 Chat Completions";
+    case "unsupported_response_schema":
+      return "Provider 响应不是 OpenAI Chat Completions 结构";
+    case "empty_choices":
+      return "Provider 返回了空 choices 数组";
+    case "empty_assistant_content":
+    case "empty_response":
+      return "模型响应中没有可用的 assistant 文本";
+    default:
+      return error.message || "Provider 请求失败";
+  }
+}
+
+function providerDiagnosticDetail(error) {
+  const code = String(error?.code || error?.name || "error").slice(0, 80);
+  if (!(error instanceof ProviderError)) return code;
+
+  const details = [code];
+  if (Number.isFinite(error.status)) details.push(`HTTP ${error.status}`);
+  if (error.contentType) details.push(`type=${error.contentType}`);
+  if (Number.isFinite(error.responseChars)) {
+    details.push(`chars=${error.responseChars}`);
+  }
+  if (Number.isFinite(error.responseBytes)) {
+    details.push(`bytes=${error.responseBytes}`);
+  }
+  if (error.responseKind) details.push(`kind=${error.responseKind}`);
+  if (error.redirected) details.push("redirected=yes");
+  if (error.endpoint) details.push(`endpoint=${error.endpoint}`);
+  if (error.remoteCode) details.push(`remoteCode=${error.remoteCode}`);
+  if (error.requestId) details.push(`requestId=${error.requestId}`);
+  if (error.responseKeys?.length) {
+    details.push(`keys=${error.responseKeys.join(",")}`);
+  }
+  if (error.routeHint) details.push(`hint=${error.routeHint}`);
+  return details.join(" · ");
+}
+
+function providerFormErrorMessage(error) {
+  const summary = providerErrorMessage(error);
+  if (!(error instanceof ProviderError)) return summary;
+  const detail = providerDiagnosticDetail(error);
+  return `${summary} · ${detail}`.slice(0, 700);
 }
 
 function startCooldown(error, providerContext = null) {
@@ -1650,7 +1717,7 @@ async function translateNow({ forceSync = false, forceOverwrite = false, reason 
       state.draft.warnings = [...new Set([...state.draft.warnings, ...error.errors, ...error.warnings])];
       updateDraftUI();
     }
-    addDiagnostic(`翻译失败：${error.code || error.name || "error"}`);
+    addDiagnostic(`翻译失败：${providerDiagnosticDetail(error)}`);
   } finally {
     if (state.mainController === controller) state.mainController = null;
     ui.translateButton.disabled = false;
@@ -2023,7 +2090,7 @@ function scheduleBackTranslation(
       } else {
         setStatus(`英文已保留，但回译失败：${providerErrorMessage(error)}`, "error");
       }
-      addDiagnostic(`回译失败：${error.code || error.name || "error"}`);
+      addDiagnostic(`回译失败：${providerDiagnosticDetail(error)}`);
       updateDraftUI();
     } finally {
       if (state.backController === controller) state.backController = null;
@@ -2547,7 +2614,7 @@ async function detectModelsFromForm() {
     ) ui.modelBackTranslate.value = ui.modelTranslate.value;
   } catch (error) {
     if (error?.name !== "AbortError" && formRequestIsCurrent(request)) {
-      ui.providerTestResult.textContent = providerErrorMessage(error) || error.message;
+      ui.providerTestResult.textContent = providerFormErrorMessage(error) || error.message;
     }
   } finally {
     finishFormRequest(request);
@@ -2613,7 +2680,7 @@ async function testProviderFromForm() {
     ui.providerTestResult.textContent = `通过 · ${Math.round(performance.now() - started)} ms · ${result.english.slice(0, 70)}${backPreview}`;
   } catch (error) {
     if (error?.name !== "AbortError" && formRequestIsCurrent(request)) {
-      ui.providerTestResult.textContent = providerErrorMessage(error) || error.message;
+      ui.providerTestResult.textContent = providerFormErrorMessage(error) || error.message;
     }
   } finally {
     finishFormRequest(request);
@@ -2735,12 +2802,32 @@ async function startManualBind() {
   const resultPromise = requestWriter("START_MANUAL_BIND", {}, 30000);
   setStatus("请切到 Claude 页面并点击真实输入框", "binding");
   const result = await resultPromise;
-  if (result.ok) {
-    setStatus("手动绑定完成", "ready");
-    addDiagnostic("用户手动选择了 Claude 输入框");
-  } else {
-    setStatus(`手动绑定失败：${result.code || "unknown"}`, "error");
+
+  if (result.ok && result.state?.composerReady) {
+    updateTargetFromWriterState({
+      writerSession: result.writerSession,
+      state: result.state
+    });
+    setStatus("手动绑定完成并已稳定定位", "ready");
+    addDiagnostic("用户手动选择的 Claude 输入节点在页面重渲染后仍存在，并保持可编辑属性");
+    updateTargetUI();
+    renderDiagnostics();
+    return;
   }
+
+  const refreshed = await requestWriter("REQUEST_WRITER_STATE", {});
+  if (refreshed.ok) {
+    updateTargetFromWriterState({
+      writerSession: refreshed.writerSession,
+      state: refreshed.state
+    });
+  }
+
+  const code = result.code || "manual_bind_not_verified";
+  setStatus(`手动绑定失败：${code}`, "error");
+  addDiagnostic(`手动绑定未通过验证：${code}`);
+  updateTargetUI();
+  renderDiagnostics();
 }
 
 async function diagnosticWrite() {

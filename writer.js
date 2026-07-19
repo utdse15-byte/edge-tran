@@ -28,6 +28,8 @@
   let manualBindHandler = null;
   let manualBindTimer = null;
   let manualBindRequestId = null;
+  let manualBindToken = 0;
+  let manualComposer = null;
   let writerSession = randomId("writer");
   let targetEpoch = 0;
   let lifecycleGeneration = 0;
@@ -90,21 +92,45 @@
   }
 
   function isEditableCandidate(element) {
-    if (!(element instanceof HTMLElement) || !isVisible(element, 120, 28)) return false;
+    if (!(element instanceof HTMLElement) || !isVisible(element, 48, 12)) {
+      return false;
+    }
     if (isTextControl(element)) return !element.disabled && !element.readOnly;
-    // role="textbox" alone is only an accessibility declaration. It is not a
-    // writable surface and must never be mutated as though it were an editor.
+    // role="textbox" alone is an accessibility declaration, not a writable
+    // surface. Only mutate an actual contenteditable editor.
     return element.isContentEditable;
   }
 
+  function composerContextFor(element) {
+    const values = [];
+    let current = element;
+
+    // Modern editors frequently put labels/test IDs on the shell while the
+    // innermost Lexical/ProseMirror node is the actual writable surface.
+    for (let depth = 0; current && depth < 4; depth += 1) {
+      const className = typeof current.className === "string"
+        ? current.className
+        : "";
+      values.push(
+        current.getAttribute("aria-label"),
+        current.getAttribute("aria-placeholder"),
+        current.getAttribute("data-placeholder"),
+        current.getAttribute("placeholder"),
+        current.getAttribute("data-testid"),
+        current.getAttribute("name"),
+        current.getAttribute("role"),
+        current.getAttribute("aria-multiline"),
+        current.getAttribute("enterkeyhint"),
+        className
+      );
+      current = current.parentElement;
+    }
+
+    return values.filter(Boolean).join(" ").toLowerCase();
+  }
+
   function messageHintFor(element) {
-    return [
-      element.getAttribute("aria-label"),
-      element.getAttribute("data-placeholder"),
-      element.getAttribute("placeholder"),
-      element.getAttribute("data-testid"),
-      element.getAttribute("name")
-    ].filter(Boolean).join(" ").toLowerCase();
+    return composerContextFor(element);
   }
 
   function sendLabelFor(button) {
@@ -118,56 +144,104 @@
     ].filter(Boolean).join(" ").trim().toLowerCase();
   }
 
+  function isExplicitSubmitButton(button) {
+    return String(button.getAttribute("type") || "").toLowerCase() === "submit";
+  }
+
+  function isSendLikeButton(button) {
+    return isExplicitSubmitButton(button)
+      || /(send|发送|提交|submit)/i.test(sendLabelFor(button));
+  }
+
   function hasAssociatedSendControl(element) {
     const form = element.closest("form");
     if (form) {
       for (const button of form.querySelectorAll("button")) {
-        if (!(button instanceof HTMLButtonElement) || button.disabled || !isVisible(button, 1, 1)) continue;
-        if (button.type === "submit" || /(send|发送|提交|submit)/i.test(sendLabelFor(button))) return true;
+        // A real chat send button is commonly disabled while the composer is
+        // empty. Disabled remains valid association evidence; whether sending
+        // is currently allowed is the host page's responsibility.
+        if (!(button instanceof HTMLButtonElement) || !isVisible(button, 1, 1)) {
+          continue;
+        }
+        // Do not treat an implicit type=submit toolbar button as Send. Only an
+        // explicit submit declaration or a send-like accessible label counts.
+        if (isSendLikeButton(button)) return true;
       }
     }
 
     const editorRect = element.getBoundingClientRect();
     for (const button of document.querySelectorAll("button")) {
-      if (!(button instanceof HTMLButtonElement) || button.disabled || !isVisible(button, 1, 1)) continue;
+      if (!(button instanceof HTMLButtonElement) || !isVisible(button, 1, 1)) {
+        continue;
+      }
       if (!/(send|发送|提交|submit)/i.test(sendLabelFor(button))) continue;
+
       const rect = button.getBoundingClientRect();
       const centerX = rect.left + rect.width / 2;
       const centerY = rect.top + rect.height / 2;
       if (
-        centerX >= editorRect.left - 120
-        && centerX <= editorRect.right + 220
-        && centerY >= editorRect.top - 120
-        && centerY <= editorRect.bottom + 120
-      ) return true;
+        centerX >= editorRect.left - 140
+        && centerX <= editorRect.right + 240
+        && centerY >= editorRect.top - 140
+        && centerY <= editorRect.bottom + 140
+      ) {
+        return true;
+      }
     }
     return false;
+  }
+
+  function hasStrongEditorSemantics(element) {
+    return Boolean(
+      element.matches?.('[data-lexical-editor="true"]')
+      || element.matches?.('.ProseMirror[contenteditable]')
+      || element.getAttribute("contenteditable") === "plaintext-only"
+      || (
+        element.getAttribute("role") === "textbox"
+        && element.getAttribute("aria-multiline") === "true"
+        && element.isContentEditable
+      )
+    );
   }
 
   function candidateScore(element) {
     const rect = element.getBoundingClientRect();
     const hint = messageHintFor(element);
-    const hasMessageHint = /(message|prompt|chat|claude|消息|输入|提问)/i.test(hint);
+    const hasMessageHint = /(message|prompt|chat|claude|compose|write|ask|消息|输入|提问)/i.test(hint);
     const hasSendControl = hasAssociatedSendControl(element);
+    const hasStrongEditor = hasStrongEditorSemantics(element);
+    const bottomComposerShape = rect.width >= 220
+      && rect.top > innerHeight * 0.32
+      && rect.bottom > innerHeight * 0.62;
 
-    // Automatic binding is deliberately fail-closed. A generic editor in the
-    // lower half of the page is not enough; it must have a message-like hint or
-    // an associated send control. Manual binding remains available otherwise.
-    if (!hasMessageHint && !hasSendControl) return Number.NEGATIVE_INFINITY;
+    // Fail closed for generic page editors. Strong editor semantics are only
+    // sufficient on a wide, lower-page composer-shaped surface.
+    if (
+      !hasMessageHint
+      && !hasSendControl
+      && !(hasStrongEditor && bottomComposerShape)
+    ) {
+      return Number.NEGATIVE_INFINITY;
+    }
 
     let score = 0;
     if (element instanceof HTMLTextAreaElement) score += 55;
     if (element instanceof HTMLInputElement) score += 30;
     if (element.isContentEditable) score += 50;
     if (element.getAttribute("role") === "textbox") score += 20;
+    if (hasStrongEditor) score += 45;
+    if (bottomComposerShape) score += 15;
     if (rect.top > innerHeight * 0.45) score += 35;
     if (rect.bottom > innerHeight * 0.75) score += 25;
     if (rect.width > 320) score += 20;
-    if (rect.height > 50) score += 10;
+    if (rect.height > 28) score += 10;
     if (hasMessageHint) score += 45;
     if (hasSendControl) score += 45;
-    if (/(search|搜索|filter|筛选)/i.test(hint)) score -= 120;
-    if (rect.bottom < innerHeight * 0.6 && !hasMessageHint) score -= 80;
+    if (/(search|搜索|filter|筛选)/i.test(hint)) score -= 160;
+    if (element.closest('article, [data-testid*="conversation-turn" i]')) {
+      score -= 90;
+    }
+    if (rect.bottom < innerHeight * 0.55 && !hasMessageHint) score -= 90;
     return score;
   }
 
@@ -178,7 +252,7 @@
       candidates.push({ element, score: candidateScore(element) });
     }
     candidates.sort((a, b) => b.score - a.score);
-    return candidates[0]?.score >= 60 ? candidates[0].element : null;
+    return candidates[0]?.score >= 55 ? candidates[0].element : null;
   }
 
   const BLOCK_TAGS = new Set([
@@ -280,13 +354,18 @@
   }
 
   function stateSnapshot() {
+    const composerReady = Boolean(
+      composer
+      && composer.isConnected
+      && isEditableCandidate(composer)
+    );
     return {
-      composerReady: Boolean(composer?.isConnected),
-      currentText: readComposerText(),
+      composerReady,
+      currentText: composerReady ? readComposerText() : "",
       targetEpoch,
       pluginOwned,
       strategy: preferredStrategy,
-      requiresFocusWrite: Boolean(composer && !isTextControl(composer))
+      requiresFocusWrite: Boolean(composerReady && !isTextControl(composer))
     };
   }
 
@@ -554,8 +633,11 @@
     reconcileTimer = null;
   }
 
-  function clearManualBind() {
-    if (manualBindHandler) document.removeEventListener("pointerdown", manualBindHandler, true);
+  function clearManualBind({ invalidate = true } = {}) {
+    if (invalidate) manualBindToken += 1;
+    if (manualBindHandler) {
+      document.removeEventListener("pointerdown", manualBindHandler, true);
+    }
     if (manualBindTimer !== null) clearTimeout(manualBindTimer);
     manualBindHandler = null;
     manualBindTimer = null;
@@ -567,7 +649,16 @@
   }
 
   function bindComposer(nextComposer, reason = "located", options = {}) {
-    if (composer === nextComposer) return;
+    if (composer === nextComposer) {
+      hiddenComposerSince = 0;
+      const state = stateSnapshot();
+      sendState(`${reason}_same`);
+      return state;
+    }
+    if (manualComposer && manualComposer !== nextComposer) {
+      // Any automatic switch to another target ends the old manual lock.
+      manualComposer = null;
+    }
     const previousComposer = composer;
     const hasPreviousTextOverride = Object.hasOwn(options, "previousText");
     const previousText = hasPreviousTextOverride
@@ -630,10 +721,12 @@
       clearSendIntent();
     }
     sendState(reason);
+    return stateSnapshot();
   }
 
   function resetForNavigation({ preserveSendIntent = false } = {}) {
     invalidateActiveMutation();
+    manualComposer = null;
     lifecycleGeneration += 1;
     writerSession = randomId("writer");
     targetEpoch += 1;
@@ -715,6 +808,28 @@
       bindComposer(locateComposer(), "rebound");
     } else {
       hiddenComposerSince = 0;
+      const betterComposer = locateComposer();
+      const currentComposerText = readComposerText(composer);
+      const betterComposerText = betterComposer
+        ? readComposerText(betterComposer)
+        : "";
+      if (
+        composer !== manualComposer
+        && betterComposer
+        && betterComposer !== composer
+        && candidateScore(betterComposer) >= candidateScore(composer) + 60
+        && (
+          !currentComposerText
+          || betterComposerText === currentComposerText
+        )
+      ) {
+        bindComposer(
+          betterComposer,
+          "higher_priority_candidate",
+          currentComposerText ? {} : { previousText: "", previouslyOwned: false }
+        );
+        return;
+      }
       reconcileComposerText({ trusted: false });
     }
   }
@@ -740,7 +855,11 @@
 
   function handleRootMutations(mutations) {
     if (!attached) return;
-    if (location.href !== lastUrl || !composer?.isConnected || !isEditableCandidate(composer)) {
+    if (
+      location.href !== lastUrl
+      || !composer?.isConnected
+      || !isEditableCandidate(composer)
+    ) {
       scheduleEnsureComposer();
       return;
     }
@@ -752,12 +871,12 @@
           return;
         }
       }
-      if (!composer) {
-        for (const node of mutation.addedNodes) {
-          if (nodeContainsEditableCandidate(node)) {
-            scheduleEnsureComposer();
-            return;
-          }
+      for (const node of mutation.addedNodes) {
+        if (nodeContainsEditableCandidate(node)) {
+          // A better main composer can appear after hydration even while an
+          // early/inline editor remains connected. Re-rank after the mutation.
+          scheduleEnsureComposer();
+          return;
         }
       }
     }
@@ -779,7 +898,9 @@
     window.addEventListener("hashchange", scheduleEnsureComposer);
     window.addEventListener("pageshow", scheduleEnsureComposer);
     rootObserver = new MutationObserver(handleRootMutations);
-    if (document.body) rootObserver.observe(document.body, { childList: true, subtree: true });
+    if (document.body) {
+      rootObserver.observe(document.body, { childList: true, subtree: true });
+    }
     bindComposer(locateComposer(), "attached");
   }
 
@@ -790,6 +911,7 @@
     lease = null;
     removeComposerListeners();
     composer = null;
+    manualComposer = null;
     document.removeEventListener("click", handleDocumentClick, true);
     document.removeEventListener("submit", handleDocumentSubmit, true);
     document.removeEventListener("keydown", handleDocumentKeydown, true);
@@ -1502,10 +1624,125 @@
     sendState("manual_baseline");
   }
 
+  function manualCandidateDistance(element, clientX, clientY) {
+    const rect = element.getBoundingClientRect();
+    const dx = clientX < rect.left
+      ? rect.left - clientX
+      : clientX > rect.right
+        ? clientX - rect.right
+        : 0;
+    const dy = clientY < rect.top
+      ? rect.top - clientY
+      : clientY > rect.bottom
+        ? clientY - rect.bottom
+        : 0;
+    return Math.hypot(dx, dy);
+  }
+
+  function bestManualCandidate(nodes, clientX, clientY) {
+    const candidates = [];
+    const seen = new Set();
+
+    const add = (element) => {
+      if (
+        !(element instanceof HTMLElement)
+        || seen.has(element)
+        || !element.matches?.(EDITABLE_SELECTOR)
+        || !isEditableCandidate(element)
+      ) {
+        return;
+      }
+      seen.add(element);
+      const rect = element.getBoundingClientRect();
+      candidates.push({
+        element,
+        distance: manualCandidateDistance(element, clientX, clientY),
+        area: Math.max(1, rect.width * rect.height)
+      });
+    };
+
+    for (const node of nodes) {
+      if (!(node instanceof HTMLElement)) continue;
+      add(node);
+      add(node.closest?.(EDITABLE_SELECTOR));
+      for (const descendant of node.querySelectorAll?.(EDITABLE_SELECTOR) || []) {
+        add(descendant);
+      }
+    }
+
+    candidates.sort((a, b) => {
+      if (a.distance !== b.distance) return a.distance - b.distance;
+      return a.area - b.area;
+    });
+    return candidates[0]?.element || null;
+  }
+
+  function manualBindCandidateFromEvent(event) {
+    const eventPath = typeof event.composedPath === "function"
+      ? event.composedPath()
+      : [event.target];
+    return bestManualCandidate(eventPath, event.clientX, event.clientY);
+  }
+
+  function manualBindCandidateAtPoint(clientX, clientY) {
+    const hit = document.elementFromPoint(clientX, clientY);
+    const path = [];
+    let current = hit instanceof HTMLElement ? hit : null;
+    for (let depth = 0; current && depth < 8; depth += 1) {
+      path.push(current);
+      current = current.parentElement;
+    }
+
+    let candidate = bestManualCandidate(path, clientX, clientY);
+    if (candidate) return candidate;
+
+    // React/Lexical may replace the clicked subtree between pointerdown and
+    // verification. Search visible editors once and select only a nearby one.
+    candidate = bestManualCandidate(
+      document.querySelectorAll(EDITABLE_SELECTOR),
+      clientX,
+      clientY
+    );
+    return candidate && manualCandidateDistance(candidate, clientX, clientY) <= 96
+      ? candidate
+      : null;
+  }
+
+  async function waitForManualBindStability() {
+    // Do not declare success in the pointerdown turn. Give Claude enough time
+    // to focus/hydrate the editor and replace a transient React node.
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    await Promise.race([
+      new Promise((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(resolve));
+      }),
+      new Promise((resolve) => setTimeout(resolve, 160))
+    ]);
+  }
+
+  function manualBindContextIsCurrent(token, expectedLease, expectedGeneration) {
+    return Boolean(
+      token === manualBindToken
+      && attached
+      && lease === expectedLease
+      && lifecycleGeneration === expectedGeneration
+    );
+  }
+
+  function finishManualBindToken(token) {
+    if (manualBindToken === token) manualBindToken += 1;
+  }
+
   function startManualBind(message) {
     if (!validateLease(message)) {
-      return rejectResult("START_MANUAL_BIND_RESULT", message.requestId, "invalid_lease", "手动绑定租约已失效");
+      return rejectResult(
+        "START_MANUAL_BIND_RESULT",
+        message.requestId,
+        "invalid_lease",
+        "手动绑定租约已失效"
+      );
     }
+
     if (manualBindRequestId) {
       post({
         type: "START_MANUAL_BIND_RESULT",
@@ -1514,30 +1751,141 @@
         code: "manual_bind_replaced",
         message: "新的手动绑定请求已替换上一次请求",
         writerSession,
-        targetEpoch
+        targetEpoch,
+        state: stateSnapshot()
       });
     }
+
     clearManualBind();
+    const operationToken = ++manualBindToken;
+    const expectedLease = lease;
+    const expectedGeneration = lifecycleGeneration;
     manualBindRequestId = message.requestId;
+
     manualBindHandler = (event) => {
-      const target = event.target instanceof HTMLElement ? event.target : null;
-      const candidate = target?.closest?.(EDITABLE_SELECTOR);
-      if (!candidate || !isEditableCandidate(candidate)) return;
+      const initialCandidate = manualBindCandidateFromEvent(event);
+      if (!initialCandidate) return;
+
       const requestId = manualBindRequestId;
-      clearManualBind();
-      bindComposer(candidate, "manual_bind");
-      post({
-        type: "START_MANUAL_BIND_RESULT",
-        requestId,
-        ok: true,
-        writerSession,
-        targetEpoch
-      });
+      const clientX = event.clientX;
+      const clientY = event.clientY;
+      // Remove the click listener and timeout without invalidating this
+      // operation. A detach or newer request will invalidate its token.
+      clearManualBind({ invalidate: false });
+
+      let selectedCandidate = null;
+      void (async () => {
+        try {
+          await waitForManualBindStability();
+
+          if (!manualBindContextIsCurrent(
+            operationToken,
+            expectedLease,
+            expectedGeneration
+          )) {
+            post({
+              type: "START_MANUAL_BIND_RESULT",
+              requestId,
+              ok: false,
+              code: "manual_bind_cancelled",
+              message: "页面、租约或手动绑定请求在验证期间发生变化",
+              writerSession,
+              targetEpoch,
+              state: stateSnapshot()
+            });
+            return;
+          }
+
+          const currentCandidate = manualBindCandidateAtPoint(clientX, clientY);
+          let candidate = initialCandidate;
+          if (
+            !candidate.isConnected
+            || !isEditableCandidate(candidate)
+            || (
+              currentCandidate
+              && currentCandidate !== candidate
+              && manualCandidateDistance(currentCandidate, clientX, clientY)
+                < manualCandidateDistance(candidate, clientX, clientY)
+            )
+          ) {
+            candidate = currentCandidate;
+          }
+
+          if (!candidate || !candidate.isConnected || !isEditableCandidate(candidate)) {
+            manualComposer = null;
+            finishManualBindToken(operationToken);
+            post({
+              type: "START_MANUAL_BIND_RESULT",
+              requestId,
+              ok: false,
+              code: "manual_bind_unstable",
+              message: "点击后输入框节点被页面替换或不可写，请再点一次真实输入区域",
+              writerSession,
+              targetEpoch,
+              state: stateSnapshot()
+            });
+            return;
+          }
+
+          selectedCandidate = candidate;
+          manualComposer = candidate;
+          const state = bindComposer(candidate, "manual_bind") || stateSnapshot();
+          const verified = Boolean(
+            manualBindContextIsCurrent(
+              operationToken,
+              expectedLease,
+              expectedGeneration
+            )
+            && state?.composerReady
+            && composer === candidate
+            && candidate.isConnected
+            && isEditableCandidate(candidate)
+          );
+
+          if (!verified && manualComposer === candidate) manualComposer = null;
+          finishManualBindToken(operationToken);
+          post({
+            type: "START_MANUAL_BIND_RESULT",
+            requestId,
+            ok: verified,
+            code: verified ? null : "manual_bind_not_verified",
+            message: verified ? "手动绑定已验证" : "手动绑定后未通过可写性验证",
+            writerSession,
+            targetEpoch,
+            state: stateSnapshot()
+          });
+        } catch (error) {
+          if (manualBindToken === operationToken) {
+            manualBindToken += 1;
+            if (manualComposer === selectedCandidate) manualComposer = null;
+          }
+          post({
+            type: "START_MANUAL_BIND_RESULT",
+            requestId,
+            ok: false,
+            code: "manual_bind_internal_error",
+            message: "手动绑定验证发生内部错误",
+            writerSession,
+            targetEpoch,
+            state: stateSnapshot(),
+            errorName: String(error?.name || "Error").slice(0, 60)
+          });
+        }
+      })();
     };
+
     document.addEventListener("pointerdown", manualBindHandler, true);
     manualBindTimer = setTimeout(() => {
+      if (!manualBindContextIsCurrent(
+        operationToken,
+        expectedLease,
+        expectedGeneration
+      )) {
+        return;
+      }
       const requestId = manualBindRequestId;
-      clearManualBind();
+      clearManualBind({ invalidate: false });
+      finishManualBindToken(operationToken);
       post({
         type: "START_MANUAL_BIND_RESULT",
         requestId,
@@ -1545,9 +1893,11 @@
         code: "manual_bind_timeout",
         message: "等待点击 Claude 输入框超时",
         writerSession,
-        targetEpoch
+        targetEpoch,
+        state: stateSnapshot()
       });
     }, 15000);
+
     post({
       type: "MANUAL_BIND_ARMED",
       requestId: message.requestId,

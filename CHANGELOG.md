@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.2.4 — 2026-07-19
+
+针对 Provider 伪成功响应与 Claude 编辑器定位/手动绑定的热修复版。
+
+### Provider 协议诊断
+
+- HTTP 200 HTML、空正文、非 JSON、200 逻辑错误、Responses API、未知 JSON、空 `choices` 与空 assistant 内容分别分类，不再统一显示 `empty_response`。
+- 设置页“检测模型”和“真实连通测试”直接显示安全协议摘要，包括 HTTP 状态、Content-Type、响应大小、请求 ID、端点和顶层结构。
+- 裸 `/chat/completions` 或 `/models` 返回 HTML 时给出“可能缺少 API 前缀”的诊断提示，但不自动尝试 `/v1` 或重复请求。
+- 恢复 `redirect: "error"`，并使用内部 tagged result，远端 JSON 无法伪造本地协议错误通道。
+- 诊断元数据经过白名单与脱敏，不保存 API Key、Authorization、提示词、请求正文、完整 HTML 或完整远端错误内容。
+
+### Claude 输入框与手动绑定
+
+- 输入语义扩展到父级 `aria-label`、`aria-placeholder`、`data-placeholder`、`data-testid` 等属性。
+- 空输入状态下 disabled 的真实发送按钮仍作为定位证据；隐式 submit 工具按钮不会被误当作发送按钮。
+- 支持短内层 Lexical/ProseMirror/plaintext-only 编辑节点，并在后续 hydration 出现更优候选时重新排名。
+- 历史消息行内编辑器降权；已验证的手动目标不会被普通自动重排抢占。
+- 手动绑定使用 `composedPath()`，等待 React/Lexical 重渲染并验证稳定性；页面导航、租约变化、detach 或新请求会取消旧的异步验证。
+- 同一节点再次手动绑定也会刷新 Writer 状态，成功结果必须携带 `composerReady`。
+
+### 测试
+
+- Node 测试扩充到 58 项，覆盖 HTML/空正文/非 JSON/结构不兼容、诊断脱敏、远端 marker 注入和禁止重定向。
+- Writer Chromium 冒烟新增父级语义 + disabled 发送按钮、React 节点替换和绑定期间 detach 取消回归。
+
 ## 0.2.3 — 2026-07-19
 
 深度缺陷审查修复版。完整问题清单与验证状态见 [BUGCHECK_REPORT.md](BUGCHECK_REPORT.md)。

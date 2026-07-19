@@ -2,7 +2,15 @@
 
 在 Edge 侧边栏输入中文，插件使用你自己的 OpenAI、xAI/Grok 或 OpenAI Chat Completions 兼容供应商生成英文，并把完整英文同步到 `claude.ai` 的消息输入框；中文回译用于检查语义。
 
-当前版本：**0.2.3**。
+当前版本：**0.2.4**。
+
+## 0.2.4 修复重点
+
+- HTTP 200 但返回 HTML、空正文、普通文本、Responses API 或未知 JSON 结构时，不再误报 `empty_response`，而是显示可判定的协议错误与安全诊断元数据。
+- 当请求落到裸 `/chat/completions` 或 `/models` 并收到网站 HTML 时，会提示 Base URL 很可能缺少 API 前缀（常见为 `/v1`）；扩展不会自行猜路由重试，避免重复计费。
+- Claude 输入框定位会读取编辑节点父级语义，允许空输入状态下 disabled 的发送按钮作为关联证据，并支持较短的 Lexical/ProseMirror 内部编辑节点。
+- 手动绑定会等待页面重渲染、重新寻找被 React/Lexical 替换的节点，并且只有在节点仍存在、可见、可编辑时才报告成功。
+- Provider 诊断只保留状态码、Content-Type、响应大小、请求 ID、端点路径和结构摘要，不保留 Key、提示词、请求正文或完整响应正文。
 
 ## 0.2.2 修复重点
 
@@ -107,6 +115,9 @@ GET  {baseUrl}/models             # 可选
 POST {baseUrl}/chat/completions   # 必需
 ```
 
+Base URL 必须包含供应商要求的 API 前缀。例如供应商的实际端点是
+`https://example.com/v1/chat/completions`，应填写 `https://example.com/v1`；也可粘贴完整的 `/chat/completions` 地址，保存时会规范化为 Base URL。不要只填写网站首页域名。
+
 ### 自定义 Header
 
 - Header 名称按大小写不敏感去重。
@@ -183,7 +194,7 @@ Claude 的富文本编辑器可能随时更新。首次安装、升级或 Claude
 
 ## 已知边界
 
-- v0.2.2 仍只实现 Chat Completions，尚未加入 Responses API。
+- v0.2.4 仍只实现 Chat Completions；若网关返回 Responses API 结构，会明确报告不兼容。
 - Provider 已开始处理的请求即使客户端 Abort，也可能仍产生费用。
 - 同请求回译是自检，不是独立语义证明。
 - 自定义兼容网关差异很大；插件只对明确的不兼容参数进行最多两步、逐项且有界的降级。

@@ -357,6 +357,139 @@ test("enforces a byte limit while reading provider responses", async () => {
   );
 });
 
+test("classifies successful non-Chat-Completions responses without leaking bodies", async () => {
+  const originalFetch = globalThis.fetch;
+  const baseConfig = {
+    baseUrl: "https://gateway.example",
+    timeoutMs: 1000,
+    capabilities: { jsonMode: false, temperature: false }
+  };
+  const secret = "sk-DO-NOT-LEAK-123";
+  const prompt = "TOP-SECRET-PROMPT";
+
+  async function capture(responseFactory) {
+    let requestOptions = null;
+    globalThis.fetch = async (_url, options) => {
+      requestOptions = options;
+      return responseFactory();
+    };
+    let caught;
+    try {
+      await chatCompletion({
+        config: baseConfig,
+        apiKey: secret,
+        model: "fixture-model",
+        messages: [{ role: "user", content: prompt }]
+      });
+    } catch (error) {
+      caught = error;
+    }
+    assert.ok(caught, "expected ProviderError");
+    const serialized = `${JSON.stringify(caught)}\n${caught.stack || ""}`;
+    assert.doesNotMatch(serialized, /sk-DO-NOT-LEAK-123|TOP-SECRET-PROMPT/);
+    assert.equal(requestOptions?.redirect, "error");
+    return caught;
+  }
+
+  try {
+    const html = "<!doctype html><html><title>website home</title></html>";
+    const htmlError = await capture(() => new Response(html, {
+      status: 200,
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        "X-Request-ID": "req-html-200"
+      }
+    }));
+    assert.equal(htmlError.code, "html_response");
+    assert.equal(htmlError.status, 200);
+    assert.equal(htmlError.contentType, "text/html; charset=utf-8");
+    assert.equal(htmlError.responseChars, html.length);
+    assert.equal(htmlError.responseKind, "html");
+    assert.equal(htmlError.endpoint, "https://gateway.example/chat/completions");
+    assert.equal(htmlError.routeHint, "missing_api_prefix_likely");
+    assert.equal(htmlError.requestId, "req-html-200");
+    assert.doesNotMatch(JSON.stringify(htmlError), /website home/);
+
+    const maliciousRequestId = await capture(() => new Response(html, {
+      status: 200,
+      headers: {
+        "Content-Type": "text/html; charset=TOP-SECRET-PROMPT",
+        "X-Request-ID": prompt
+      }
+    }));
+    assert.equal(maliciousRequestId.code, "html_response");
+    assert.equal(maliciousRequestId.contentType, "text/html");
+    assert.equal(maliciousRequestId.requestId, "");
+
+    const cases = [
+      ["empty_body", () => new Response("", {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      })],
+      ["non_json_response", () => new Response("plain gateway response", {
+        status: 200,
+        headers: { "Content-Type": "text/plain" }
+      })],
+      ["logical_api_error", () => new Response(JSON.stringify({
+        error: { code: "invalid_model", message: `${prompt} ${secret}` }
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      })],
+      ["responses_api_response", () => new Response(JSON.stringify({
+        object: "response",
+        output: [{ content: [{ type: "output_text", text: "hello" }] }]
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      })],
+      ["unsupported_response_schema", () => new Response(JSON.stringify({
+        data: { text: "hello" }
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      })],
+      ["empty_choices", () => new Response(JSON.stringify({ choices: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      })],
+      ["empty_assistant_content", () => new Response(JSON.stringify({
+        choices: [{ finish_reason: "stop", message: { content: "" } }]
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      })]
+    ];
+
+    for (const [expectedCode, responseFactory] of cases) {
+      const error = await capture(responseFactory);
+      assert.equal(error.code, expectedCode);
+    }
+
+    // A remote JSON object must not be able to spoof the reader's private
+    // classification channel and inject its own error message.
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      __edgeTranProtocolError: {
+        code: "html_response",
+        message: `${prompt} ${secret}`
+      },
+      choices: [{ finish_reason: "stop", message: { content: "translated" } }]
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+    const result = await chatCompletion({
+      config: baseConfig,
+      apiKey: secret,
+      model: "fixture-model",
+      messages: [{ role: "user", content: prompt }]
+    });
+    assert.equal(result.text, "translated");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("rejects oversized or malformed provider requests before fetch", async () => {
   const originalFetch = globalThis.fetch;
   let fetchCalls = 0;

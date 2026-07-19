@@ -81,5 +81,49 @@ with sync_playwright() as p:
   r=send(page, {'type':'WRITE_TARGET','requestId':'detach-mid-write','lease':'L','text':'translated','expectedWriterSession':ws,'expectedTargetEpoch':0,'allowFocus':False,'force':True})
   assert r and not r['ok'] and r['code'] in {'target_changed', 'invalid_lease'}, r
   assert page.locator('#editor').input_value()=='original', page.locator('#editor').input_value()
+  page.close()
+
+  # The real writable node may be a short inner Lexical editor while the
+  # message hint lives on its parent and the empty-state Send button is disabled.
+  page=b.new_page(viewport={'width':1200,'height':800})
+  page.set_content('''<!doctype html><body>
+    <div style="height:610px"></div>
+    <form data-testid="chat-input" aria-label="Compose message" onsubmit="return false">
+      <div id="editor" contenteditable="true" data-lexical-editor="true" role="textbox"
+           style="width:700px;height:14px;border:1px solid"></div>
+      <button id="send" type="button" aria-label="Send message" disabled>Send</button>
+    </form>
+  </body>''')
+  page.evaluate('''() => {const messages=[];const msgListeners=[];const disconnect=[];const port={postMessage(m){messages.push(structuredClone(m));},onMessage:{addListener(fn){msgListeners.push(fn)}},onDisconnect:{addListener(fn){disconnect.push(fn)}},disconnect(){for(const fn of disconnect)fn();}};window.__h={messages,msgListeners,disconnect};window.chrome={runtime:{id:'test',connect(){return port}}};}''')
+  page.add_script_tag(content=js); page.wait_for_timeout(30)
+  hello=page.evaluate('window.__h.messages.find(m=>m.type==="WRITER_HELLO")'); ws=hello['writerSession']
+  page.evaluate('(m)=>window.__h.msgListeners[0](m)', {'type':'ATTACH','lease':'L'}); page.wait_for_timeout(100)
+  st=send(page, {'type':'REQUEST_WRITER_STATE','requestId':'parent-hint-state','lease':'L'})
+  assert st['ok'] and st['state']['composerReady'], (st, page.evaluate('window.__h.messages'))
+  r=send(page, {'type':'WRITE_TARGET','requestId':'parent-hint-write','lease':'L','text':'detected','expectedWriterSession':ws,'expectedTargetEpoch':st['state']['targetEpoch'],'allowFocus':True})
+  assert r['ok'] and page.locator('#editor').inner_text()=='detected', r
+  page.close()
+
+  # Manual binding must survive a React/Lexical node replacement after
+  # pointerdown, and an in-flight verification must cancel after detach.
+  page=b.new_page(viewport={'width':1200,'height':800}); hello=setup(page,'ce')
+  page.locator('#editor').evaluate('''(e) => e.addEventListener('pointerdown', () => {
+    const replacement = e.cloneNode(false);
+    replacement.id = 'editor';
+    e.replaceWith(replacement);
+  }, { once: true })''')
+  page.evaluate('(m)=>window.__h.msgListeners[0](m)', {'type':'START_MANUAL_BIND','requestId':'manual-replace','lease':'L'})
+  page.wait_for_timeout(20); page.locator('#editor').click(); page.wait_for_timeout(320)
+  manual_result=page.evaluate('window.__h.messages.findLast(m=>m.type==="START_MANUAL_BIND_RESULT" && m.requestId==="manual-replace")')
+  assert manual_result and manual_result['ok'] and manual_result['state']['composerReady'], (manual_result, page.evaluate('window.__h.messages'))
+  r=send(page, {'type':'WRITE_TARGET','requestId':'manual-replace-write','lease':'L','text':'replacement bound','expectedWriterSession':manual_result['writerSession'],'expectedTargetEpoch':manual_result['targetEpoch'],'allowFocus':True})
+  assert r['ok'] and page.locator('#editor').inner_text()=='replacement bound', r
+
+  page.evaluate('(m)=>window.__h.msgListeners[0](m)', {'type':'START_MANUAL_BIND','requestId':'manual-cancel','lease':'L'})
+  page.wait_for_timeout(20); page.locator('#editor').click()
+  page.evaluate('(m)=>window.__h.msgListeners[0](m)', {'type':'DETACH','lease':'L','reason':'manual_bind_cancel_test'})
+  page.wait_for_timeout(320)
+  cancelled=page.evaluate('window.__h.messages.findLast(m=>m.type==="START_MANUAL_BIND_RESULT" && m.requestId==="manual-cancel")')
+  assert cancelled and not cancelled['ok'] and cancelled['code']=='manual_bind_cancelled', (cancelled, page.evaluate('window.__h.messages'))
   page.close(); b.close()
 print('Writer browser smoke: PASS')
