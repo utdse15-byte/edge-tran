@@ -1,0 +1,14 @@
+{
+  "name": "claude-zh-en-edge-extension",
+  "private": true,
+  "version": "0.2.2",
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "check": "node scripts/check-syntax.js",
+    "audit": "node scripts/audit.mjs",
+    "verify": "npm run check && npm test && npm run audit",
+    "smoke:browser": "python3 scripts/writer-browser-smoke.py && python3 scripts/writer-browser-test.py && python3 scripts/panel-browser-smoke.py && python3 scripts/panel-browser-test.py",
+    "verify:full": "npm run verify && npm run smoke:browser"
+  }
+}

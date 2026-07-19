@@ -1,0 +1,1522 @@
+(() => {
+  "use strict";
+
+  const SEND_INTENT_TTL_MS = 3000;
+  const REBIND_DELAY_MS = 80;
+  const PORT_RECONNECT_DELAY_MS = 450;
+  const EDITABLE_SELECTOR = [
+    "textarea",
+    'input[type="text"]',
+    'input[type="search"]',
+    'input[type="url"]',
+    'input[type="email"]',
+    "input:not([type])",
+    '[contenteditable]:not([contenteditable="false"])'
+  ].join(", ");
+
+  let port = null;
+  let portReconnectTimer = null;
+  let attached = false;
+  let lease = null;
+  let composer = null;
+  let rootObserver = null;
+  let composerObserver = null;
+  let reconcileTimer = null;
+  let rebindTimer = null;
+  let manualBindHandler = null;
+  let manualBindTimer = null;
+  let manualBindRequestId = null;
+  let writerSession = randomId("writer");
+  let targetEpoch = 0;
+  let lifecycleGeneration = 0;
+  let lastWritten = "";
+  let lastObservedText = "";
+  let pluginOwned = false;
+  let suppressUntil = 0;
+  let expectedWriteText = "";
+  let sendIntent = null;
+  let lastUrl = location.href;
+  let preferredStrategy = null;
+  let activeMutation = null;
+  let mutationQueue = Promise.resolve();
+
+  function randomId(prefix) {
+    const bytes = new Uint8Array(10);
+    crypto.getRandomValues(bytes);
+    return `${prefix}_${[...bytes].map((value) => value.toString(16).padStart(2, "0")).join("")}`;
+  }
+
+  function post(message) {
+    try {
+      port?.postMessage(message);
+    } catch {
+      // The extension was reloaded or the service worker disconnected.
+    }
+  }
+
+  function normalizeText(value) {
+    return String(value ?? "")
+      .replace(/\r\n?/g, "\n")
+      .replace(/\u00a0/g, " ")
+      .replace(/[\u200b\ufeff]/g, "")
+      .replace(/[ \t]+$/gm, "")
+      .trimEnd();
+  }
+
+  function isVisible(element, minWidth = 1, minHeight = 1) {
+    if (!(element instanceof HTMLElement)) return false;
+    const style = getComputedStyle(element);
+    if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
+    const rect = element.getBoundingClientRect();
+    return (
+      rect.width >= minWidth
+      && rect.height >= minHeight
+      && rect.bottom > 0
+      && rect.top < innerHeight
+      && rect.right > 0
+      && rect.left < innerWidth
+    );
+  }
+
+  function isTextControl(element) {
+    return element instanceof HTMLTextAreaElement || (
+      element instanceof HTMLInputElement
+      && ["text", "search", "url", "email", ""].includes(element.type)
+    );
+  }
+
+  function isEditableCandidate(element) {
+    if (!(element instanceof HTMLElement) || !isVisible(element, 120, 28)) return false;
+    if (isTextControl(element)) return !element.disabled && !element.readOnly;
+    // role="textbox" alone is only an accessibility declaration. It is not a
+    // writable surface and must never be mutated as though it were an editor.
+    return element.isContentEditable;
+  }
+
+  function messageHintFor(element) {
+    return [
+      element.getAttribute("aria-label"),
+      element.getAttribute("data-placeholder"),
+      element.getAttribute("placeholder"),
+      element.getAttribute("data-testid"),
+      element.getAttribute("name")
+    ].filter(Boolean).join(" ").toLowerCase();
+  }
+
+  function sendLabelFor(button) {
+    return [
+      button.getAttribute("aria-label"),
+      button.getAttribute("data-testid"),
+      button.getAttribute("name"),
+      button.id,
+      button.title,
+      button.textContent
+    ].filter(Boolean).join(" ").trim().toLowerCase();
+  }
+
+  function hasAssociatedSendControl(element) {
+    const form = element.closest("form");
+    if (form) {
+      for (const button of form.querySelectorAll("button")) {
+        if (!(button instanceof HTMLButtonElement) || button.disabled || !isVisible(button, 1, 1)) continue;
+        if (button.type === "submit" || /(send|发送|提交|submit)/i.test(sendLabelFor(button))) return true;
+      }
+    }
+
+    const editorRect = element.getBoundingClientRect();
+    for (const button of document.querySelectorAll("button")) {
+      if (!(button instanceof HTMLButtonElement) || button.disabled || !isVisible(button, 1, 1)) continue;
+      if (!/(send|发送|提交|submit)/i.test(sendLabelFor(button))) continue;
+      const rect = button.getBoundingClientRect();
+      const centerX = rect.left + rect.width / 2;
+      const centerY = rect.top + rect.height / 2;
+      if (
+        centerX >= editorRect.left - 120
+        && centerX <= editorRect.right + 220
+        && centerY >= editorRect.top - 120
+        && centerY <= editorRect.bottom + 120
+      ) return true;
+    }
+    return false;
+  }
+
+  function candidateScore(element) {
+    const rect = element.getBoundingClientRect();
+    const hint = messageHintFor(element);
+    const hasMessageHint = /(message|prompt|chat|claude|消息|输入|提问)/i.test(hint);
+    const hasSendControl = hasAssociatedSendControl(element);
+
+    // Automatic binding is deliberately fail-closed. A generic editor in the
+    // lower half of the page is not enough; it must have a message-like hint or
+    // an associated send control. Manual binding remains available otherwise.
+    if (!hasMessageHint && !hasSendControl) return Number.NEGATIVE_INFINITY;
+
+    let score = 0;
+    if (element instanceof HTMLTextAreaElement) score += 55;
+    if (element instanceof HTMLInputElement) score += 30;
+    if (element.isContentEditable) score += 50;
+    if (element.getAttribute("role") === "textbox") score += 20;
+    if (rect.top > innerHeight * 0.45) score += 35;
+    if (rect.bottom > innerHeight * 0.75) score += 25;
+    if (rect.width > 320) score += 20;
+    if (rect.height > 50) score += 10;
+    if (hasMessageHint) score += 45;
+    if (hasSendControl) score += 45;
+    if (/(search|搜索|filter|筛选)/i.test(hint)) score -= 120;
+    if (rect.bottom < innerHeight * 0.6 && !hasMessageHint) score -= 80;
+    return score;
+  }
+
+  function locateComposer() {
+    const candidates = [];
+    for (const element of document.querySelectorAll(EDITABLE_SELECTOR)) {
+      if (!isEditableCandidate(element)) continue;
+      candidates.push({ element, score: candidateScore(element) });
+    }
+    candidates.sort((a, b) => b.score - a.score);
+    return candidates[0]?.score >= 60 ? candidates[0].element : null;
+  }
+
+  const BLOCK_TAGS = new Set([
+    "ADDRESS", "ARTICLE", "ASIDE", "BLOCKQUOTE", "DIV", "DL", "FIELDSET",
+    "FIGCAPTION", "FIGURE", "FOOTER", "FORM", "H1", "H2", "H3", "H4",
+    "H5", "H6", "HEADER", "HR", "LI", "MAIN", "NAV", "OL", "P", "PRE",
+    "SECTION", "TABLE", "UL"
+  ]);
+
+  function isBlockElement(node) {
+    return node instanceof HTMLElement && BLOCK_TAGS.has(node.tagName);
+  }
+
+  function serializeInlineNode(node) {
+    if (node.nodeType === Node.TEXT_NODE) return node.nodeValue ?? "";
+    if (!(node instanceof Element)) return "";
+    if (node.tagName === "BR") return "\n";
+    if (isBlockElement(node)) return serializeContentContainer(node);
+    let text = "";
+    for (const child of node.childNodes) text += serializeInlineNode(child);
+    return text;
+  }
+
+  function serializeBlock(node) {
+    const meaningful = [...node.childNodes].filter((child) => {
+      if (child.nodeType === Node.TEXT_NODE) return Boolean(child.nodeValue);
+      return child instanceof Element;
+    });
+    if (meaningful.length === 1 && meaningful[0] instanceof HTMLBRElement) return "";
+    return serializeContentContainer(node);
+  }
+
+  function serializeContentContainer(container) {
+    const segments = [];
+    let inline = "";
+    const flushInline = () => {
+      if (inline !== "") {
+        segments.push(inline);
+        inline = "";
+      }
+    };
+
+    for (const child of container.childNodes) {
+      if (isBlockElement(child)) {
+        flushInline();
+        segments.push(serializeBlock(child));
+      } else {
+        inline += serializeInlineNode(child);
+      }
+    }
+    flushInline();
+    return segments.join("\n");
+  }
+
+  function readComposerText(element = composer) {
+    if (!element) return "";
+    if (isTextControl(element)) return normalizeText(element.value);
+    return normalizeText(serializeContentContainer(element));
+  }
+
+  function protectedComposerNode(element = composer) {
+    if (!element || isTextControl(element)) return null;
+    const alwaysAtomic = element.querySelector(
+      'img, video, audio, canvas, iframe, object, embed, input, select, textarea, button, '
+      + '[data-attachment], [data-file-id], [data-testid*="attachment" i], '
+      + '[aria-label*="attachment" i], [aria-label*="attached" i], '
+      + '[aria-label*="附件"], [aria-label*="文件"]'
+    );
+    if (alwaysAtomic) return alwaysAtomic;
+
+    // Rich editors use contenteditable=false for atomic chips such as file
+    // attachments and mentions. Ignore empty decoration nodes, but never select
+    // across a meaningful atomic node because execCommand could delete it even
+    // when the visible text readback appears unchanged.
+    for (const node of element.querySelectorAll('[contenteditable="false"]')) {
+      if (!(node instanceof HTMLElement)) continue;
+      const hasMeaningfulText = Boolean(normalizeText(node.textContent));
+      const hasMeaningfulDescendant = Boolean(node.querySelector('img, video, audio, canvas, svg, [data-attachment], [data-file-id]'));
+      const label = [node.getAttribute("aria-label"), node.getAttribute("title")]
+        .filter(Boolean)
+        .join(" ")
+        .trim();
+      if (hasMeaningfulText || hasMeaningfulDescendant || label) return node;
+    }
+    return null;
+  }
+
+  function stateSnapshot() {
+    return {
+      composerReady: Boolean(composer?.isConnected),
+      currentText: readComposerText(),
+      targetEpoch,
+      pluginOwned,
+      strategy: preferredStrategy,
+      requiresFocusWrite: Boolean(composer && !isTextControl(composer))
+    };
+  }
+
+  function sendState(reason = "state") {
+    post({
+      type: "WRITER_STATE",
+      writerSession,
+      reason,
+      state: stateSnapshot()
+    });
+  }
+
+  function validSendIntent() {
+    return Boolean(
+      sendIntent
+      && sendIntent.writerSession === writerSession
+      && sendIntent.targetEpoch === targetEpoch
+      && Date.now() - sendIntent.timestamp <= SEND_INTENT_TTL_MS
+    );
+  }
+
+  function clearSendIntent() {
+    sendIntent = null;
+  }
+
+  function recordSendIntent(kind) {
+    const text = readComposerText();
+    if (!text) return;
+    sendIntent = {
+      kind,
+      text,
+      timestamp: Date.now(),
+      writerSession,
+      targetEpoch
+    };
+    setTimeout(() => {
+      if (sendIntent && Date.now() - sendIntent.timestamp > SEND_INTENT_TTL_MS) clearSendIntent();
+    }, SEND_INTENT_TTL_MS + 100);
+  }
+
+  function confirmClear(previousText, intentOverride = null) {
+    const currentIntent = validSendIntent() ? sendIntent : null;
+    const candidateIntent = intentOverride ?? currentIntent;
+    const intent = candidateIntent
+      && normalizeText(candidateIntent.text) === normalizeText(previousText)
+      ? candidateIntent
+      : null;
+    targetEpoch += 1;
+    lastWritten = "";
+    lastObservedText = "";
+    pluginOwned = false;
+    clearSendIntent();
+
+    if (intent && normalizeText(intent.text)) {
+      post({
+        type: "SEND_CONFIRMED",
+        writerSession,
+        targetEpoch,
+        sentText: intent.text,
+        intentKind: intent.kind
+      });
+    } else {
+      post({
+        type: "TARGET_CLEARED",
+        writerSession,
+        targetEpoch,
+        previousText: normalizeText(previousText)
+      });
+    }
+    sendState(intent ? "send_confirmed" : "external_clear");
+  }
+
+  function reportManualEdit(current, reason = "manual_edit") {
+    const normalized = normalizeText(current);
+    targetEpoch += 1;
+    pluginOwned = false;
+    lastObservedText = normalized;
+    clearSendIntent();
+    post({
+      type: "TARGET_MANUAL_EDIT",
+      writerSession,
+      targetEpoch,
+      text: normalized
+    });
+    sendState(reason);
+  }
+
+  function reportRecoveryFailure(current, reason = "write_recovery_failed") {
+    targetEpoch += 1;
+    pluginOwned = false;
+    lastObservedText = normalizeText(current);
+    clearSendIntent();
+    post({
+      type: "TARGET_WRITE_RECOVERY_FAILED",
+      writerSession,
+      targetEpoch,
+      text: normalizeText(current),
+      reason
+    });
+    sendState(reason);
+  }
+
+  function reconcileComposerText({ trusted = false } = {}) {
+    if (!attached || !composer) return;
+    // execCommand/native setters can emit trusted-looking input and multiple
+    // transient DOM states. The serialized mutation owns that very short
+    // interval and validates the final readback itself.
+    if (activeMutation?.element === composer) return;
+
+    const current = readComposerText();
+    const previous = lastObservedText;
+    if (current === previous) return;
+    lastObservedText = current;
+
+    if (performance.now() < suppressUntil && current === normalizeText(expectedWriteText)) return;
+    if (!trusted && current === normalizeText(expectedWriteText)) return;
+
+    if (!current && previous) {
+      confirmClear(previous);
+      return;
+    }
+
+    if (validSendIntent() && current !== normalizeText(sendIntent.text)) clearSendIntent();
+
+    if (current !== normalizeText(lastWritten)) reportManualEdit(current);
+  }
+
+  function handleComposerInput(event) {
+    // A real line break means the plain Enter key was used as editing input,
+    // not as a send command. readComposerText() trims trailing whitespace, so
+    // relying on the resulting text alone can leave a stale keyboard intent
+    // alive and misclassify a later manual clear as a confirmed send.
+    if (
+      event.isTrusted
+      && sendIntent?.kind === "keyboard"
+      && ["insertParagraph", "insertLineBreak"].includes(String(event.inputType || ""))
+    ) clearSendIntent();
+
+    if (activeMutation?.element === composer && event.isTrusted) {
+      const current = readComposerText();
+      if (
+        current !== activeMutation.expectedText
+        && current !== activeMutation.beforeText
+      ) activeMutation.userInterference = true;
+    }
+    reconcileComposerText({ trusted: event.isTrusted });
+  }
+
+  function handleComposerKeydown(event) {
+    if (!event.isTrusted || event.isComposing || event.keyCode === 229) return;
+    if (activeMutation?.element === composer) activeMutation.userInterference = true;
+    // Only treat a plain Enter as an intent. Modified Enter shortcuts vary by
+    // Claude/user settings; a real submit event is captured separately and is
+    // safer than guessing that Ctrl/Meta/Alt+Enter always means send.
+    if (
+      event.key === "Enter"
+      && !event.shiftKey
+      && !event.ctrlKey
+      && !event.metaKey
+      && !event.altKey
+    ) recordSendIntent("keyboard");
+  }
+
+  function buttonLooksLikeSend(button) {
+    if (!(button instanceof HTMLButtonElement) || button.disabled || !isVisible(button, 1, 1)) return false;
+    const label = sendLabelFor(button);
+    const composerForm = composer?.closest("form");
+    const sameForm = Boolean(composerForm && composerForm === button.closest("form"));
+    if (button.type === "submit" && sameForm) return true;
+    if (!/(send|发送|提交|submit)/i.test(label)) return false;
+    if (sameForm) return true;
+
+    const composerRect = composer?.getBoundingClientRect();
+    const buttonRect = button.getBoundingClientRect();
+    if (!composerRect) return false;
+    const centerX = buttonRect.left + buttonRect.width / 2;
+    const centerY = buttonRect.top + buttonRect.height / 2;
+    return (
+      centerX >= composerRect.left - 100
+      && centerX <= composerRect.right + 180
+      && centerY >= composerRect.top - 100
+      && centerY <= composerRect.bottom + 100
+    );
+  }
+
+  function handleDocumentClick(event) {
+    if (!attached || !event.isTrusted || !composer) return;
+    const button = event.target instanceof Element ? event.target.closest("button") : null;
+    if (buttonLooksLikeSend(button)) recordSendIntent("button");
+  }
+
+  function handleDocumentSubmit(event) {
+    if (!attached || !event.isTrusted || !composer) return;
+    const form = event.target instanceof HTMLFormElement ? event.target : null;
+    if (form && composer.closest("form") === form) recordSendIntent("form");
+  }
+
+  function scheduleComposerReconcile() {
+    if (!attached || reconcileTimer !== null) return;
+    reconcileTimer = setTimeout(() => {
+      reconcileTimer = null;
+      reconcileComposerText({ trusted: false });
+    }, 0);
+  }
+
+  function observeComposerMutations() {
+    composerObserver?.disconnect();
+    composerObserver = null;
+    if (!composer || isTextControl(composer)) return;
+    composerObserver = new MutationObserver(scheduleComposerReconcile);
+    composerObserver.observe(composer, {
+      childList: true,
+      subtree: true,
+      characterData: true
+    });
+  }
+
+  function removeComposerListeners() {
+    if (composer) {
+      composer.removeEventListener("input", handleComposerInput, true);
+      composer.removeEventListener("keydown", handleComposerKeydown, true);
+    }
+    composerObserver?.disconnect();
+    composerObserver = null;
+    if (reconcileTimer !== null) clearTimeout(reconcileTimer);
+    reconcileTimer = null;
+  }
+
+  function clearManualBind() {
+    if (manualBindHandler) document.removeEventListener("pointerdown", manualBindHandler, true);
+    if (manualBindTimer !== null) clearTimeout(manualBindTimer);
+    manualBindHandler = null;
+    manualBindTimer = null;
+    manualBindRequestId = null;
+  }
+
+  function invalidateActiveMutation() {
+    if (activeMutation) activeMutation.invalidated = true;
+  }
+
+  function bindComposer(nextComposer, reason = "located", options = {}) {
+    if (composer === nextComposer) return;
+    const previousComposer = composer;
+    const hasPreviousTextOverride = Object.hasOwn(options, "previousText");
+    const previousText = hasPreviousTextOverride
+      ? normalizeText(options.previousText)
+      : readComposerText(previousComposer);
+    const previouslyOwned = Object.hasOwn(options, "previouslyOwned")
+      ? Boolean(options.previouslyOwned)
+      : pluginOwned;
+    // Capture a valid send intent before changing targetEpoch. Claude may
+    // replace the composer node after a successful send without changing the
+    // URL; validating only after the rebind would incorrectly invalidate the
+    // trusted intent and leave the side-panel draft unarchived. A navigation
+    // caller may provide the intent captured before writerSession changed.
+    const replacementSendIntent = Object.hasOwn(options, "sendIntent")
+      ? options.sendIntent
+      : previousComposer && nextComposer && validSendIntent()
+        && normalizeText(sendIntent?.text) === normalizeText(previousText)
+        ? { ...sendIntent }
+        : null;
+    invalidateActiveMutation();
+    removeComposerListeners();
+    composer = nextComposer;
+
+    if (previousComposer && previousComposer !== nextComposer) {
+      targetEpoch += 1;
+    }
+
+    if (!composer) {
+      lastObservedText = "";
+      pluginOwned = false;
+      if (previousText) confirmClear(previousText, replacementSendIntent);
+      else sendState("composer_missing");
+      return;
+    }
+
+    composer.addEventListener("input", handleComposerInput, true);
+    composer.addEventListener("keydown", handleComposerKeydown, true);
+    observeComposerMutations();
+    const current = readComposerText();
+    lastObservedText = current;
+
+    if (!current && previousText) {
+      // A composer replacement that drops non-empty text is observable even
+      // without a URL change. Treat it as a confirmed send only when the
+      // trusted intent captured above matches; otherwise report an external
+      // clear so the Chinese source is preserved and automatic sync pauses.
+      confirmClear(previousText, replacementSendIntent);
+    } else if (previouslyOwned && current === normalizeText(lastWritten)) {
+      pluginOwned = true;
+      clearSendIntent();
+    } else if (current !== normalizeText(lastWritten)) {
+      pluginOwned = false;
+      clearSendIntent();
+    }
+    sendState(reason);
+  }
+
+  function resetForNavigation({ preserveSendIntent = false } = {}) {
+    invalidateActiveMutation();
+    lifecycleGeneration += 1;
+    writerSession = randomId("writer");
+    targetEpoch += 1;
+    lastWritten = "";
+    pluginOwned = false;
+    preferredStrategy = null;
+    if (!preserveSendIntent) clearSendIntent();
+    post({
+      type: "WRITER_SESSION_CHANGED",
+      writerSession,
+      targetEpoch
+    });
+  }
+
+  function ensureComposer() {
+    rebindTimer = null;
+    if (!attached) return;
+    if (location.href !== lastUrl) {
+      const previousObservedText = lastObservedText;
+      const wasPluginOwned = pluginOwned;
+      const navigationSendIntent = validSendIntent()
+        && normalizeText(sendIntent?.text) === normalizeText(previousObservedText)
+        ? { ...sendIntent }
+        : null;
+      lastUrl = location.href;
+      resetForNavigation({ preserveSendIntent: Boolean(navigationSendIntent) });
+      // SPA navigation frequently replaces the editor node. A replacement and
+      // the URL transition are one logical event: let bindComposer reconcile
+      // the old text exactly once. The old implementation confirmed the clear
+      // here and then confirmed it again while rebinding, producing a false
+      // TARGET_CLEARED immediately after SEND_CONFIRMED.
+      const nextComposer = composer?.isConnected && isEditableCandidate(composer)
+        ? composer
+        : locateComposer();
+      if (nextComposer !== composer) {
+        bindComposer(nextComposer, "navigation_rebound", {
+          previousText: previousObservedText,
+          sendIntent: navigationSendIntent,
+          previouslyOwned: wasPluginOwned
+        });
+      } else {
+        const currentAfterNavigation = readComposerText(nextComposer);
+        if (!currentAfterNavigation && previousObservedText) {
+          confirmClear(previousObservedText, navigationSendIntent);
+        } else {
+          lastObservedText = currentAfterNavigation;
+          clearSendIntent();
+          sendState("navigation_same_composer");
+        }
+      }
+    }
+    if (!composer?.isConnected || !isEditableCandidate(composer)) bindComposer(locateComposer(), "rebound");
+    else reconcileComposerText({ trusted: false });
+  }
+
+  function scheduleEnsureComposer() {
+    if (rebindTimer !== null) return;
+    rebindTimer = setTimeout(ensureComposer, REBIND_DELAY_MS);
+  }
+
+  function nodeContainsComposer(node) {
+    return Boolean(
+      composer
+      && node instanceof Node
+      && (node === composer || (node instanceof Element && node.contains(composer)))
+    );
+  }
+
+  function nodeContainsEditableCandidate(node) {
+    if (!(node instanceof Element)) return false;
+    if (node.matches?.(EDITABLE_SELECTOR)) return true;
+    return Boolean(node.querySelector?.(EDITABLE_SELECTOR));
+  }
+
+  function handleRootMutations(mutations) {
+    if (!attached) return;
+    if (location.href !== lastUrl || !composer?.isConnected || !isEditableCandidate(composer)) {
+      scheduleEnsureComposer();
+      return;
+    }
+
+    for (const mutation of mutations) {
+      for (const node of mutation.removedNodes) {
+        if (nodeContainsComposer(node)) {
+          scheduleEnsureComposer();
+          return;
+        }
+      }
+      if (!composer) {
+        for (const node of mutation.addedNodes) {
+          if (nodeContainsEditableCandidate(node)) {
+            scheduleEnsureComposer();
+            return;
+          }
+        }
+      }
+    }
+  }
+
+  function attach(attachLease) {
+    if (attached && lease === attachLease) {
+      sendState("already_attached");
+      return;
+    }
+    detach("reattach");
+    lifecycleGeneration += 1;
+    attached = true;
+    lease = attachLease;
+    document.addEventListener("click", handleDocumentClick, true);
+    document.addEventListener("submit", handleDocumentSubmit, true);
+    window.addEventListener("popstate", scheduleEnsureComposer);
+    window.addEventListener("hashchange", scheduleEnsureComposer);
+    window.addEventListener("pageshow", scheduleEnsureComposer);
+    rootObserver = new MutationObserver(handleRootMutations);
+    if (document.body) rootObserver.observe(document.body, { childList: true, subtree: true });
+    bindComposer(locateComposer(), "attached");
+  }
+
+  function detach(reason = "detached") {
+    lifecycleGeneration += 1;
+    invalidateActiveMutation();
+    attached = false;
+    lease = null;
+    removeComposerListeners();
+    composer = null;
+    document.removeEventListener("click", handleDocumentClick, true);
+    document.removeEventListener("submit", handleDocumentSubmit, true);
+    window.removeEventListener("popstate", scheduleEnsureComposer);
+    window.removeEventListener("hashchange", scheduleEnsureComposer);
+    window.removeEventListener("pageshow", scheduleEnsureComposer);
+    rootObserver?.disconnect();
+    rootObserver = null;
+    if (rebindTimer !== null) clearTimeout(rebindTimer);
+    rebindTimer = null;
+    clearManualBind();
+    clearSendIntent();
+    if (reason !== "reattach") {
+      preferredStrategy = null;
+      expectedWriteText = "";
+      suppressUntil = 0;
+    }
+  }
+
+  function dispatchInput(element, text, inputType = "insertText") {
+    try {
+      element.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        composed: true,
+        data: text,
+        inputType
+      }));
+    } catch {
+      element.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+  }
+
+  async function settleDom() {
+    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  function enqueueMutation(task, onError) {
+    const run = mutationQueue.then(task, task);
+    mutationQueue = run.catch(() => undefined);
+    if (typeof onError === "function") void run.catch(onError);
+    return run;
+  }
+
+  function beginMutation(element, beforeText, expectedText) {
+    const operation = {
+      id: randomId("write"),
+      element,
+      writerSession,
+      targetEpoch,
+      lifecycleGeneration,
+      beforeText: normalizeText(beforeText),
+      expectedText: normalizeText(expectedText),
+      invalidated: false,
+      userInterference: false
+    };
+    activeMutation = operation;
+    return operation;
+  }
+
+  function endMutation(operation) {
+    if (activeMutation === operation) activeMutation = null;
+    // Input/MutationObserver callbacks are intentionally suppressed while the
+    // transaction owns the editor. Reconcile once more after the caller has
+    // committed or rejected the transaction so a late DOM-only change cannot
+    // remain invisible.
+    queueMicrotask(() => reconcileComposerText({ trusted: false }));
+  }
+
+  function operationStillCurrent(operation) {
+    return Boolean(
+      operation
+      && activeMutation === operation
+      && !operation.invalidated
+      && attached
+      && operation.element === composer
+      && operation.element?.isConnected
+      && operation.writerSession === writerSession
+      && operation.targetEpoch === targetEpoch
+      && operation.lifecycleGeneration === lifecycleGeneration
+      && document.visibilityState !== "hidden"
+    );
+  }
+
+  function restorePageFocus(previousActive, target) {
+    try {
+      if (
+        previousActive instanceof HTMLElement
+        && previousActive !== target
+        && previousActive.isConnected
+        && previousActive !== document.body
+        && previousActive !== document.documentElement
+      ) {
+        previousActive.focus({ preventScroll: true });
+      } else if (previousActive !== target) {
+        target.blur();
+      }
+    } catch {
+      // Focus restoration is best effort; panel.js restores the sidebar editor.
+    }
+  }
+
+  function setNativeControlValue(element, value) {
+    const prototype = element instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype;
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+    if (!descriptor?.set) return false;
+    descriptor.set.call(element, value);
+    dispatchInput(element, value, value ? "insertText" : "deleteContentBackward");
+    return true;
+  }
+
+  async function writeTextControl(operation, element, text) {
+    const beforeRaw = element.value;
+    const before = normalizeText(beforeRaw);
+    const prototype = element instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype;
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+    if (!descriptor?.set) {
+      return { ok: false, code: "native_setter_missing", strategy: "native-value-setter", focusUsed: false, before };
+    }
+
+    descriptor.set.call(element, text);
+    dispatchInput(element, text, text ? "insertText" : "deleteContentBackward");
+    await settleDom();
+    if (!operationStillCurrent(operation)) {
+      const interruptedReadback = readComposerText(element);
+      if (
+        !operation.userInterference
+        && element.isConnected
+        && interruptedReadback === normalizeText(text)
+        && interruptedReadback !== before
+      ) {
+        expectedWriteText = beforeRaw;
+        suppressUntil = performance.now() + 900;
+        descriptor.set.call(element, beforeRaw);
+        dispatchInput(element, beforeRaw, beforeRaw ? "insertText" : "deleteContentBackward");
+        await settleDom();
+        const restored = readComposerText(element) === before;
+        if (restored) lastObservedText = before;
+        return {
+          ok: false,
+          code: restored ? "write_failed_rolled_back" : "write_failed_not_restored",
+          strategy: "native-value-setter",
+          focusUsed: false,
+          before,
+          readback: interruptedReadback,
+          restored
+        };
+      }
+      return {
+        ok: false,
+        code: operation.userInterference ? "write_interrupted" : "target_changed",
+        strategy: "native-value-setter",
+        focusUsed: false,
+        before,
+        readback: interruptedReadback
+      };
+    }
+
+    const readback = readComposerText(element);
+    if (readback === normalizeText(text)) {
+      return { ok: true, strategy: "native-value-setter", focusUsed: false, before, readback };
+    }
+    if (readback === before) {
+      return { ok: false, code: "write_rejected", strategy: "native-value-setter", focusUsed: false, before, readback };
+    }
+    if (operation.userInterference) {
+      operation.invalidated = true;
+      return { ok: false, code: "write_interrupted", strategy: "native-value-setter", focusUsed: false, before, readback };
+    }
+
+    expectedWriteText = beforeRaw;
+    suppressUntil = performance.now() + 900;
+    descriptor.set.call(element, beforeRaw);
+    dispatchInput(element, beforeRaw, beforeRaw ? "insertText" : "deleteContentBackward");
+    await settleDom();
+    const restored = operationStillCurrent(operation) && readComposerText(element) === before;
+    if (restored) {
+      lastObservedText = before;
+      return {
+        ok: false,
+        code: "write_failed_rolled_back",
+        strategy: "native-value-setter",
+        focusUsed: false,
+        before,
+        readback,
+        restored: true
+      };
+    }
+    return {
+      ok: false,
+      code: "write_failed_not_restored",
+      strategy: "native-value-setter",
+      focusUsed: false,
+      before,
+      readback: readComposerText(element),
+      restored: false
+    };
+  }
+
+  function selectEditorContents(element) {
+    const selection = window.getSelection();
+    if (!selection) return false;
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    return true;
+  }
+
+  function runEditCommand(element, text) {
+    element.focus({ preventScroll: true });
+    if (!selectEditorContents(element)) return false;
+    try {
+      return text
+        ? document.execCommand("insertText", false, text)
+        : document.execCommand("delete", false);
+    } catch {
+      return false;
+    }
+  }
+
+  async function writeContentEditableFocus(operation, element, text) {
+    const before = readComposerText(element);
+    const previousActive = document.activeElement;
+    const commandResult = runEditCommand(element, text);
+    await settleDom();
+
+    if (!operationStillCurrent(operation)) {
+      const interruptedReadback = readComposerText(element);
+      let restored = interruptedReadback === before;
+      if (
+        !restored
+        && !operation.userInterference
+        && element.isConnected
+        && !protectedComposerNode(element)
+        && interruptedReadback === normalizeText(text)
+      ) {
+        expectedWriteText = before;
+        suppressUntil = performance.now() + 900;
+        runEditCommand(element, before);
+        await settleDom();
+        restored = readComposerText(element) === before;
+        if (restored) lastObservedText = before;
+      }
+      restorePageFocus(previousActive, element);
+      await settleDom();
+      return {
+        ok: false,
+        code: restored
+          ? "write_failed_rolled_back"
+          : operation.userInterference
+            ? "write_interrupted"
+            : "write_failed_not_restored",
+        strategy: "focus-execcommand",
+        focusUsed: true,
+        before,
+        readback: interruptedReadback,
+        restored
+      };
+    }
+
+    const readback = readComposerText(element);
+    if (readback === normalizeText(text)) {
+      restorePageFocus(previousActive, element);
+      await settleDom();
+      return {
+        ok: true,
+        strategy: commandResult ? "focus-execcommand" : "focus-execcommand-readback",
+        focusUsed: true,
+        before,
+        readback
+      };
+    }
+    if (readback === before) {
+      restorePageFocus(previousActive, element);
+      await settleDom();
+      return {
+        ok: false,
+        code: commandResult ? "write_rejected" : "execcommand_unavailable",
+        strategy: "focus-execcommand",
+        focusUsed: true,
+        before,
+        readback
+      };
+    }
+    if (operation.userInterference) {
+      operation.invalidated = true;
+      restorePageFocus(previousActive, element);
+      await settleDom();
+      return {
+        ok: false,
+        code: "write_interrupted",
+        strategy: "focus-execcommand",
+        focusUsed: true,
+        before,
+        readback
+      };
+    }
+
+    // A file/mention chip can appear asynchronously while the transaction is
+    // settling. Never select-all again to roll back across newly introduced
+    // atomic content; preserve the page as-is and force manual review instead.
+    if (protectedComposerNode(element)) {
+      restorePageFocus(previousActive, element);
+      await settleDom();
+      return {
+        ok: false,
+        code: "write_failed_not_restored",
+        strategy: "focus-execcommand",
+        focusUsed: true,
+        before,
+        readback,
+        restored: false,
+        protectedContentAppeared: true,
+        commandResult
+      };
+    }
+
+    expectedWriteText = before;
+    suppressUntil = performance.now() + 900;
+    const rollbackIssued = runEditCommand(element, before);
+    await settleDom();
+    const restored = operationStillCurrent(operation) && readComposerText(element) === before;
+    restorePageFocus(previousActive, element);
+    await settleDom();
+
+    if (restored) {
+      lastObservedText = before;
+      return {
+        ok: false,
+        code: "write_failed_rolled_back",
+        strategy: "focus-execcommand",
+        focusUsed: true,
+        before,
+        readback,
+        restored: true,
+        commandResult,
+        rollbackIssued
+      };
+    }
+
+    return {
+      ok: false,
+      code: "write_failed_not_restored",
+      strategy: "focus-execcommand",
+      focusUsed: true,
+      before,
+      readback: readComposerText(element),
+      restored: false,
+      commandResult,
+      rollbackIssued
+    };
+  }
+
+  async function setComposerText(operation, target, text, { allowFocus = true } = {}) {
+    if (!target || target !== composer || !target.isConnected) {
+      return { ok: false, code: "target_changed", focusUsed: false };
+    }
+    if (isTextControl(target)) return writeTextControl(operation, target, text);
+    if (!allowFocus) {
+      return {
+        ok: false,
+        code: "focus_write_disabled",
+        strategy: "focus-required",
+        focusUsed: false
+      };
+    }
+    return writeContentEditableFocus(operation, target, text);
+  }
+
+  function validateLease(message) {
+    return attached && lease && message?.lease === lease;
+  }
+
+  function rejectResult(type, requestId, code, message, details = {}) {
+    post({
+      type,
+      requestId,
+      ok: false,
+      code,
+      message,
+      writerSession,
+      targetEpoch,
+      ...details
+    });
+  }
+
+  function validateExpectedState(message, resultType, actionLabel) {
+    // history.pushState() does not emit popstate and may not mutate the DOM.
+    // Reconcile the URL synchronously before every stateful command so a
+    // translation queued for one Claude conversation cannot land in another.
+    if (attached && location.href !== lastUrl) ensureComposer();
+
+    if (Number.isFinite(message?.deadline) && Date.now() > message.deadline) {
+      rejectResult(resultType, message.requestId, "command_expired", `${actionLabel}请求已过期，未执行`);
+      return false;
+    }
+    if (!validateLease(message)) {
+      rejectResult(resultType, message.requestId, "invalid_lease", `${actionLabel}租约已失效`);
+      return false;
+    }
+    if (!composer?.isConnected) {
+      rejectResult(resultType, message.requestId, "composer_missing", "未找到 Claude 输入框");
+      return false;
+    }
+    if (message.expectedWriterSession && message.expectedWriterSession !== writerSession) {
+      rejectResult(resultType, message.requestId, "writer_session_changed", "Claude 页面会话已变化");
+      return false;
+    }
+    if (Number.isInteger(message.expectedTargetEpoch) && message.expectedTargetEpoch !== targetEpoch) {
+      rejectResult(resultType, message.requestId, "target_epoch_changed", "Claude 输入框已变化");
+      return false;
+    }
+    return true;
+  }
+
+  async function handleWrite(message) {
+    const resultType = "WRITE_TARGET_RESULT";
+    if (!validateExpectedState(message, resultType, "写入")) return;
+    if (document.visibilityState === "hidden") {
+      return rejectResult(resultType, message.requestId, "target_inactive", "目标 Claude 标签页不在前台，未执行写入");
+    }
+
+    const targetElement = composer;
+    const operationSession = writerSession;
+    const operationEpoch = targetEpoch;
+    const operationGeneration = lifecycleGeneration;
+    const current = readComposerText(targetElement);
+    if (protectedComposerNode(targetElement)) {
+      return rejectResult(
+        resultType,
+        message.requestId,
+        "protected_content_present",
+        "Claude 输入框中含有附件、图片或不可安全替换的富文本节点；未执行自动写入"
+      );
+    }
+    if (pluginOwned && current !== normalizeText(lastWritten)) {
+      reportManualEdit(current);
+      return rejectResult(resultType, message.requestId, "manual_edit", "检测到人工修改，未覆盖");
+    }
+    if (current && !pluginOwned && !message.force) {
+      return rejectResult(resultType, message.requestId, "manual_edit", "Claude 输入框已有非插件内容，未覆盖");
+    }
+
+    const text = String(message.text ?? "");
+    clearSendIntent();
+    expectedWriteText = text;
+    suppressUntil = performance.now() + 900;
+    const operation = beginMutation(targetElement, current, text);
+    let writeResult;
+    try {
+      writeResult = await setComposerText(operation, targetElement, text, {
+        allowFocus: message.allowFocus === true
+      });
+    } finally {
+      endMutation(operation);
+    }
+
+    if (writeResult?.code === "write_failed_not_restored") {
+      const dirtyText = readComposerText(targetElement);
+      reportRecoveryFailure(dirtyText, "write_recovery_failed");
+      return rejectResult(
+        resultType,
+        message.requestId,
+        "write_failed_not_restored",
+        "写入未通过校验且无法恢复原内容，已停止自动覆盖",
+        { focusUsed: Boolean(writeResult.focusUsed) }
+      );
+    }
+
+    if (writeResult?.code === "write_interrupted" || operation.userInterference) {
+      const interruptedText = readComposerText(targetElement);
+      reportManualEdit(interruptedText, "write_interrupted");
+      return rejectResult(
+        resultType,
+        message.requestId,
+        "write_interrupted",
+        "写入过程中检测到用户输入，已停止自动覆盖",
+        { focusUsed: Boolean(writeResult?.focusUsed) }
+      );
+    }
+
+    if (
+      writerSession !== operationSession
+      || targetEpoch !== operationEpoch
+      || lifecycleGeneration !== operationGeneration
+      || composer !== targetElement
+      || !targetElement.isConnected
+      || operation.invalidated
+    ) {
+      return rejectResult(
+        resultType,
+        message.requestId,
+        "target_changed",
+        "写入期间 Claude 输入框或页面会话发生了变化",
+        { focusUsed: Boolean(writeResult?.focusUsed) }
+      );
+    }
+
+    const readback = readComposerText(targetElement);
+    if (!writeResult?.ok || readback !== normalizeText(text)) {
+      return rejectResult(
+        resultType,
+        message.requestId,
+        writeResult?.code || "write_failed",
+        writeResult?.code === "focus_write_disabled"
+          ? "当前富文本输入框需要聚焦写入；请先完成页面诊断并在设置中启用"
+          : "写入未通过回读校验；未把结果标记为已同步",
+        { focusUsed: Boolean(writeResult?.focusUsed) }
+      );
+    }
+
+    preferredStrategy = writeResult.strategy;
+    targetEpoch += 1;
+    lastWritten = normalizeText(text);
+    lastObservedText = lastWritten;
+    pluginOwned = true;
+    post({
+      type: resultType,
+      requestId: message.requestId,
+      ok: true,
+      writerSession,
+      targetEpoch,
+      readback,
+      strategy: writeResult.strategy,
+      focusUsed: writeResult.focusUsed
+    });
+    sendState("plugin_write");
+  }
+
+  async function handleClearIfOwned(message) {
+    const resultType = "CLEAR_TARGET_IF_OWNED_RESULT";
+    if (!validateExpectedState(message, resultType, "清理")) return;
+    if (document.visibilityState === "hidden") {
+      return rejectResult(resultType, message.requestId, "target_inactive", "目标 Claude 标签页不在前台，未执行清理");
+    }
+
+    const targetElement = composer;
+    const operationSession = writerSession;
+    const operationEpoch = targetEpoch;
+    const operationGeneration = lifecycleGeneration;
+    const current = readComposerText(targetElement);
+    if (protectedComposerNode(targetElement)) {
+      return rejectResult(
+        resultType,
+        message.requestId,
+        "protected_content_present",
+        "Claude 输入框中含有附件、图片或不可安全替换的富文本节点；未执行自动清理"
+      );
+    }
+    if (!pluginOwned || current !== normalizeText(lastWritten)) {
+      return rejectResult(resultType, message.requestId, "not_plugin_owned", "当前内容不是插件的最后写入值");
+    }
+
+    clearSendIntent();
+    expectedWriteText = "";
+    suppressUntil = performance.now() + 900;
+    const operation = beginMutation(targetElement, current, "");
+    let clearResult;
+    try {
+      clearResult = await setComposerText(operation, targetElement, "", {
+        allowFocus: message.allowFocus === true
+      });
+    } finally {
+      endMutation(operation);
+    }
+
+    if (clearResult?.code === "write_failed_not_restored") {
+      const dirtyText = readComposerText(targetElement);
+      reportRecoveryFailure(dirtyText, "clear_recovery_failed");
+      return rejectResult(
+        resultType,
+        message.requestId,
+        "clear_failed_not_restored",
+        "清理失败且无法恢复原内容，已停止自动覆盖",
+        { focusUsed: Boolean(clearResult.focusUsed) }
+      );
+    }
+
+    if (clearResult?.code === "write_interrupted" || operation.userInterference) {
+      const interruptedText = readComposerText(targetElement);
+      reportManualEdit(interruptedText, "clear_interrupted");
+      return rejectResult(
+        resultType,
+        message.requestId,
+        "write_interrupted",
+        "清理过程中检测到用户输入，已停止自动覆盖",
+        { focusUsed: Boolean(clearResult?.focusUsed) }
+      );
+    }
+
+    if (
+      writerSession !== operationSession
+      || targetEpoch !== operationEpoch
+      || lifecycleGeneration !== operationGeneration
+      || composer !== targetElement
+      || !targetElement.isConnected
+      || operation.invalidated
+    ) {
+      return rejectResult(
+        resultType,
+        message.requestId,
+        "target_changed",
+        "清理期间 Claude 输入框或页面会话发生了变化",
+        { focusUsed: Boolean(clearResult?.focusUsed) }
+      );
+    }
+
+    if (!clearResult?.ok || readComposerText(targetElement) !== "") {
+      return rejectResult(
+        resultType,
+        message.requestId,
+        clearResult?.code || "clear_failed",
+        clearResult?.code === "focus_write_disabled"
+          ? "富文本输入框无法在不聚焦的情况下安全清除；旧译文仍保留"
+          : "未能安全清除旧译文",
+        { focusUsed: Boolean(clearResult?.focusUsed) }
+      );
+    }
+
+    targetEpoch += 1;
+    lastWritten = "";
+    lastObservedText = "";
+    pluginOwned = false;
+    post({
+      type: resultType,
+      requestId: message.requestId,
+      ok: true,
+      writerSession,
+      targetEpoch,
+      strategy: clearResult.strategy,
+      focusUsed: clearResult.focusUsed
+    });
+    sendState("stale_target_cleared");
+  }
+
+  function handleGetTargetText(message) {
+    const resultType = "GET_TARGET_TEXT_RESULT";
+    if (!validateExpectedState(message, resultType, "读取")) return;
+    post({
+      type: resultType,
+      requestId: message.requestId,
+      ok: true,
+      code: null,
+      writerSession,
+      targetEpoch,
+      text: readComposerText(),
+      pluginOwned
+    });
+  }
+
+  function handleSetBaseline(message) {
+    const resultType = "SET_BASELINE_RESULT";
+    if (!validateExpectedState(message, resultType, "基线")) return;
+    const current = readComposerText();
+    lastWritten = current;
+    lastObservedText = current;
+    pluginOwned = false;
+    clearSendIntent();
+    post({
+      type: resultType,
+      requestId: message.requestId,
+      ok: true,
+      writerSession,
+      targetEpoch,
+      text: current
+    });
+    sendState("manual_baseline");
+  }
+
+  function startManualBind(message) {
+    if (!validateLease(message)) {
+      return rejectResult("START_MANUAL_BIND_RESULT", message.requestId, "invalid_lease", "手动绑定租约已失效");
+    }
+    if (manualBindRequestId) {
+      post({
+        type: "START_MANUAL_BIND_RESULT",
+        requestId: manualBindRequestId,
+        ok: false,
+        code: "manual_bind_replaced",
+        message: "新的手动绑定请求已替换上一次请求",
+        writerSession,
+        targetEpoch
+      });
+    }
+    clearManualBind();
+    manualBindRequestId = message.requestId;
+    manualBindHandler = (event) => {
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      const candidate = target?.closest?.(EDITABLE_SELECTOR);
+      if (!candidate || !isEditableCandidate(candidate)) return;
+      const requestId = manualBindRequestId;
+      clearManualBind();
+      bindComposer(candidate, "manual_bind");
+      post({
+        type: "START_MANUAL_BIND_RESULT",
+        requestId,
+        ok: true,
+        writerSession,
+        targetEpoch
+      });
+    };
+    document.addEventListener("pointerdown", manualBindHandler, true);
+    manualBindTimer = setTimeout(() => {
+      const requestId = manualBindRequestId;
+      clearManualBind();
+      post({
+        type: "START_MANUAL_BIND_RESULT",
+        requestId,
+        ok: false,
+        code: "manual_bind_timeout",
+        message: "等待点击 Claude 输入框超时",
+        writerSession,
+        targetEpoch
+      });
+    }, 15000);
+    post({
+      type: "MANUAL_BIND_ARMED",
+      requestId: message.requestId,
+      writerSession,
+      targetEpoch
+    });
+  }
+
+  function queueWriterCommand(message, handler) {
+    enqueueMutation(
+      () => handler(message),
+      (error) => rejectResult(
+        `${message.type}_RESULT`,
+        message.requestId,
+        "writer_internal_error",
+        "Claude 写入器发生内部错误",
+        { errorName: String(error?.name || "Error").slice(0, 60) }
+      )
+    );
+  }
+
+  function handlePortMessage(message) {
+    switch (message?.type) {
+      case "ATTACH":
+        attach(message.lease);
+        break;
+      case "DETACH":
+        if (!message.lease || message.lease === lease) detach(message.reason);
+        break;
+      case "WRITE_TARGET":
+        queueWriterCommand(message, handleWrite);
+        break;
+      case "CLEAR_TARGET_IF_OWNED":
+        queueWriterCommand(message, handleClearIfOwned);
+        break;
+      case "GET_TARGET_TEXT":
+        queueWriterCommand(message, handleGetTargetText);
+        break;
+      case "SET_BASELINE":
+        queueWriterCommand(message, handleSetBaseline);
+        break;
+      case "START_MANUAL_BIND":
+        startManualBind(message);
+        break;
+      case "REQUEST_WRITER_STATE":
+        queueWriterCommand(message, () => {
+          if (attached && location.href !== lastUrl) ensureComposer();
+          sendState("requested");
+          post({
+            type: "REQUEST_WRITER_STATE_RESULT",
+            requestId: message.requestId,
+            ok: validateLease(message),
+            code: validateLease(message) ? null : "invalid_lease",
+            writerSession,
+            targetEpoch,
+            state: stateSnapshot()
+          });
+        });
+        break;
+      default:
+        break;
+    }
+  }
+
+  function schedulePortReconnect() {
+    if (portReconnectTimer !== null) return;
+    try {
+      if (!chrome.runtime?.id) return;
+    } catch {
+      return;
+    }
+    portReconnectTimer = setTimeout(() => {
+      portReconnectTimer = null;
+      connectPort();
+    }, PORT_RECONNECT_DELAY_MS);
+  }
+
+  function connectPort() {
+    if (port) return;
+    let nextPort;
+    try {
+      nextPort = chrome.runtime.connect({ name: "zh2en-writer" });
+    } catch {
+      schedulePortReconnect();
+      return;
+    }
+
+    port = nextPort;
+    nextPort.onMessage.addListener(handlePortMessage);
+    nextPort.onDisconnect.addListener(() => {
+      if (port !== nextPort) return;
+      port = null;
+      detach("port_disconnected");
+      schedulePortReconnect();
+    });
+
+    post({
+      type: "WRITER_HELLO",
+      writerSession,
+      state: stateSnapshot()
+    });
+  }
+
+  connectPort();
+})();

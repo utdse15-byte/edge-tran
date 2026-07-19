@@ -1,0 +1,1565 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import {
+  buildHeaders,
+  chatCompletion,
+  endpointUrl,
+  filterLikelyTextModels,
+  normalizeBaseUrl,
+  permissionPatternForBaseUrl,
+  readLimitedText,
+  sanitizeExtraHeaders
+} from "../lib/provider.js";
+import {
+  protectText,
+  restorePlaceholders,
+  validatePlaceholderIntegrity
+} from "../lib/placeholders.js";
+import {
+  buildBackTranslationWarnings,
+  buildSoftWarnings,
+  parseTranslationJson,
+  validateBackTranslationText,
+  validateEnglishTranslationText,
+  validateTranslationPayload
+} from "../lib/validation.js";
+import { backTranslate, translateDraft } from "../lib/translator.js";
+import {
+  getSecretForProvider,
+  loadDraftState,
+  normalizeStoredDiagnostics,
+  normalizeStoredDraft,
+  normalizeStoredHistory,
+  normalizeStoredProvider,
+  normalizeStoredSettings,
+  providerCredentialBinding,
+  saveActiveDraft,
+  saveBehaviorSettings,
+  saveConfiguration,
+  scopedSessionKey
+} from "../lib/storage.js";
+import {
+  BACK_TRANSLATION_MODES,
+  STORAGE_KEYS,
+  isCurrentDraftSend,
+  isEnglishRevisionCurrent,
+  normalizeText,
+  targetContextMatches
+} from "../lib/shared.js";
+
+test("normalizes provider URLs and endpoints", () => {
+  assert.equal(normalizeBaseUrl("https://api.openai.com/v1/"), "https://api.openai.com/v1");
+  assert.equal(normalizeBaseUrl("https://example.com/openai/v1/models"), "https://example.com/openai/v1");
+  assert.equal(endpointUrl("https://api.x.ai/v1", "chat/completions"), "https://api.x.ai/v1/chat/completions");
+  assert.equal(permissionPatternForBaseUrl("https://api.x.ai/v1"), "https://api.x.ai/*");
+  assert.throws(() => normalizeBaseUrl("http://remote.example/v1"));
+  assert.throws(() => normalizeBaseUrl("https://claude.ai/api/v1"));
+  assert.equal(normalizeBaseUrl("http://localhost:11434/v1"), "http://localhost:11434/v1");
+  assert.throws(() => normalizeBaseUrl(`https://example.com/${"a".repeat(2100)}`), /过长/);
+});
+
+test("filters model list without blocking manual use", () => {
+  const models = ["gpt-5-mini", "text-embedding-3-small", "grok-fast", "audio-preview"];
+  assert.deepEqual(filterLikelyTextModels(models), ["gpt-5-mini", "grok-fast"]);
+  assert.deepEqual(filterLikelyTextModels(models, true), models);
+});
+
+test("removes unsafe and payload-controlling headers", () => {
+  assert.deepEqual(
+    sanitizeExtraHeaders({
+      Cookie: "secret",
+      Host: "bad",
+      "Sec-Fetch-Site": "cross-site",
+      "Bad Header": "invalid",
+      "X-Newline": "a\nb",
+      "Content-Type": "text/plain",
+      Accept: "text/html",
+      "X-Backup-Token": "must-not-be-persisted",
+      "X-API-Key": "must-use-auth-header-instead",
+      "X-Project": "demo",
+      "x-project": "must-not-duplicate",
+      Authorization: "other"
+    }),
+    { "X-Project": "demo" }
+  );
+  assert.throws(
+    () => buildHeaders({ authHeader: "Content-Type", authPrefix: "Bearer" }, "secret"),
+    /鉴权 Header/
+  );
+  assert.equal(
+    buildHeaders({ authHeader: "X-API-Key", authPrefix: "" }, "secret")["X-API-Key"],
+    "secret"
+  );
+  assert.throws(
+    () => buildHeaders({ authHeader: "__proto__", authPrefix: "" }, "secret"),
+    /鉴权 Header/
+  );
+});
+
+test("protects and restores code, URL, email, path and protected terms", () => {
+  const source = "请保留 Claude、`x += 1`、https://example.com/a、me@example.com 和 C:\\tmp\\a.txt。";
+  const result = protectText(source, ["Claude"]);
+  assert.notEqual(result.protectedText, source);
+  assert.ok(result.placeholders.length >= 5);
+
+  const translated = `Please keep ${result.placeholders.map((item) => item.token).join(" and ")}.`;
+  const integrity = validatePlaceholderIntegrity(translated, result.placeholders, result.prefix);
+  assert.deepEqual(integrity.errors, []);
+  const restored = restorePlaceholders(translated, result.placeholders);
+  for (const item of result.placeholders) assert.ok(restored.includes(item.value));
+});
+
+test("protects an unclosed fenced code block through end of draft", () => {
+  const source = "请检查：\n```js\nconst value = 1;\n不要改变量名";
+  const result = protectText(source, []);
+  assert.equal(result.placeholders.length, 1);
+  assert.equal(result.placeholders[0].kind, "fenced_code");
+  assert.equal(result.placeholders[0].value, "```js\nconst value = 1;\n不要改变量名");
+  assert.equal(restorePlaceholders(result.protectedText, result.placeholders), source);
+});
+
+test("placeholder protection is collision-resistant and bounded", () => {
+  const result = protectText("保留 `value`", []);
+  assert.match(result.prefix, /^ZH2EN_[A-F0-9]{24}$/);
+
+  const withUnrelatedLiteral = `${result.placeholders[0].token} ⟦ZH2EN_AAAAAAAAAAAAAAAAAAAAAAAA_P9⟧`;
+  assert.deepEqual(
+    validatePlaceholderIntegrity(withUnrelatedLiteral, result.placeholders, result.prefix).errors,
+    [],
+    "an unrelated token-like literal belongs to user data, not this request namespace"
+  );
+  const withCurrentNamespaceUnknown = `${result.placeholders[0].token} ⟦${result.prefix}_P9⟧`;
+  const integrity = validatePlaceholderIntegrity(
+    withCurrentNamespaceUnknown,
+    result.placeholders,
+    result.prefix
+  );
+  assert.ok(integrity.errors.some((item) => item.includes("未知占位符")));
+
+  assert.throws(
+    () => protectText("甲".repeat(1001), ["甲"]),
+    /受保护片段超过 1000 个/
+  );
+});
+
+test("placeholder integrity rejects missing and duplicate tokens", () => {
+  const result = protectText("`a` 和 `b`", []);
+  const duplicate = `${result.placeholders[0].token} ${result.placeholders[0].token}`;
+  const integrity = validatePlaceholderIntegrity(duplicate, result.placeholders, result.prefix);
+  assert.ok(integrity.errors.some((item) => item.includes("重复")));
+  assert.ok(integrity.errors.some((item) => item.includes("缺失")));
+});
+
+test("parses fenced JSON output", () => {
+  const payload = parseTranslationJson('```json\n{"english":"Hello","corrections":[],"ambiguous":[]}\n```');
+  assert.equal(payload.english, "Hello");
+});
+
+test("parses the first valid balanced JSON object without greedily joining objects", () => {
+  const payload = parseTranslationJson(
+    'gateway note {"broken":} more text {"english":"Hello","back_translation":"你好","corrections":[],"ambiguous":[]} trailing'
+  );
+  assert.equal(payload.english, "Hello");
+  assert.equal(payload.back_translation, "你好");
+});
+
+test("skips valid gateway metadata JSON before the translation object", () => {
+  const payload = parseTranslationJson(
+    '{"request_id":"req_123"}\n{"english":"Hello","back_translation":"你好","corrections":[],"ambiguous":[]}'
+  );
+  assert.equal(payload.english, "Hello");
+  assert.equal(payload.back_translation, "你好");
+});
+
+test("bounds malformed JSON candidate scanning and fails closed", () => {
+  const malformedPrefix = "{".repeat(80);
+  assert.throws(
+    () => parseTranslationJson(`${malformedPrefix}{"english":"must not be reached"}`),
+    /没有返回可解析的 JSON/
+  );
+});
+
+test("accepts a narrowly scoped obvious typo and rejects technical corrections", () => {
+  const accepted = validateTranslationPayload({
+    english: "Delete this function.",
+    corrections: [{ original: "删出", interpreted_as: "删除", reason: "明显同音输入错误" }],
+    ambiguous: []
+  }, "请删出这个函数");
+  assert.deepEqual(accepted.errors, []);
+  assert.equal(accepted.corrections.length, 1);
+
+  const rejected = validateTranslationPayload({
+    english: "Use GPT-5.",
+    corrections: [{ original: "GPT-4", interpreted_as: "GPT-5", reason: "升级" }],
+    ambiguous: []
+  }, "使用 GPT-4");
+  assert.ok(rejected.errors.length > 0);
+});
+
+test("rejects typo claims that alter negation, modality or broad phrases", () => {
+  for (const [source, original, interpreted_as] of [
+    ["不要删除", "不要", "要"],
+    ["这可能失败", "可能", "一定"],
+    ["请删除这个函数", "删除这个函数", "保留这个函数"]
+  ]) {
+    const result = validateTranslationPayload({
+      english: "test",
+      corrections: [{ original, interpreted_as, reason: "model claim" }],
+      ambiguous: []
+    }, source);
+    assert.ok(result.errors.some((item) => item.includes("笔误")), `${original} should be rejected`);
+  }
+});
+
+test("adds soft warnings without rejecting numbers", () => {
+  const warnings = buildSoftWarnings("版本 12，成功率 95%", "Version 13, success rate 90%.");
+  assert.ok(warnings.some((item) => item.includes("数字")));
+  assert.equal(
+    buildSoftWarnings("版本 12。", "Version 12.").some((item) => item.includes("数字")),
+    false,
+    "sentence punctuation must not become part of a number token"
+  );
+  assert.equal(
+    buildSoftWarnings("成功率 50％", "Success rate 50%.").some((item) => item.includes("数字")),
+    false,
+    "full-width and ASCII percent signs should be equivalent"
+  );
+});
+
+test("adds self-back-translation warnings without rejecting the translation", () => {
+  const warnings = buildBackTranslationWarnings(
+    "版本 12，成功率 95%",
+    "Version 12, success rate 95%.",
+    "版本 13，成功率 90%。"
+  );
+  assert.ok(warnings.some((item) => item.includes("数字")));
+  assert.ok(buildBackTranslationWarnings(
+    "请检查这段代码，不要改整体结构。",
+    "Please review this code without changing its overall structure.",
+    "Back-translation: please review this code."
+  ).some((item) => item.includes("说明性前缀")));
+  assert.ok(buildBackTranslationWarnings(
+    "请检查这段代码，不要改整体结构。",
+    "Please review this code without changing its overall structure.",
+    "回译如下：请检查这段代码。"
+  ).some((item) => item.includes("说明性前缀")));
+});
+
+test("requires real English output and Chinese back-translation even for short Chinese drafts", () => {
+  const echoed = validateEnglishTranslationText("你好", "你好", []);
+  assert.ok(echoed.errors.some((item) => item.includes("没有形成英文")));
+  assert.ok(
+    validateEnglishTranslationText("你好", "123", []).errors.some((item) => item.includes("没有形成英文")),
+    "digits alone are not English unless the Chinese source is numeric"
+  );
+  assert.deepEqual(validateEnglishTranslationText("一千五", "1,500", []).errors, []);
+
+  const shortBack = validateBackTranslationText("你好", "Hello.", "Hello.");
+  assert.ok(shortBack.errors.some((item) => item.includes("没有中文")));
+  assert.deepEqual(validateBackTranslationText("你好", "Hello.", "你好。 ").errors, []);
+});
+
+test("rejects a non-Chinese back-translation and warns when same-request output copies the source", () => {
+  const invalid = validateBackTranslationText(
+    "请检查这段代码，不要改整体结构。",
+    "Please review this code without changing its overall structure.",
+    "Please review this code."
+  );
+  assert.ok(invalid.errors.some((item) => item.includes("没有中文")));
+
+  const shortInvalid = validateBackTranslationText("你好", "Hello", "Hello");
+  assert.ok(shortInvalid.errors.some((item) => item.includes("没有中文")));
+
+  const copied = validateBackTranslationText(
+    "请检查这段代码，不要改变整体结构。",
+    "Please review this code without changing its overall structure.",
+    "请检查这段代码，不要改变整体结构。"
+  );
+  assert.ok(copied.warnings.some((item) => item.includes("完全相同")));
+});
+
+test("normalizes editor text without collapsing meaningful blank lines or Unicode joiners", () => {
+  assert.equal(normalizeText("a\r\n\r\n\r\nb\u00a0 \n"), "a\n\n\nb");
+  assert.equal(normalizeText("a\u200bb"), "ab");
+  assert.equal(normalizeText("👨‍👩‍👧‍👦"), "👨‍👩‍👧‍👦");
+  assert.equal(normalizeText("می\u200cخواهم"), "می\u200cخواهم");
+});
+
+test("only clears a draft after sending its current English version", () => {
+  assert.equal(isCurrentDraftSend({
+    sentText: "Current English",
+    draftEnglish: "Current English",
+    englishSourceRevision: 7,
+    sourceRevision: 7,
+    targetPhase: "synced"
+  }), true);
+
+  assert.equal(isCurrentDraftSend({
+    sentText: "Old English",
+    draftEnglish: "Old English",
+    englishSourceRevision: 6,
+    sourceRevision: 7,
+    targetPhase: "synced"
+  }), false);
+
+  assert.equal(isCurrentDraftSend({
+    sentText: "Manually refined English",
+    draftEnglish: "Original translation",
+    manualTargetText: "Manually refined English",
+    englishSourceRevision: 7,
+    sourceRevision: 7,
+    targetPhase: "manual"
+  }), true);
+});
+
+test("blocks a translation result when the bound Claude target changes", () => {
+  assert.equal(targetContextMatches(
+    { tabId: 11, writerSession: "writer_a", targetEpoch: 4 },
+    { tabId: 11, writerSession: "writer_a", targetEpoch: 4 }
+  ), true);
+  assert.equal(targetContextMatches(
+    { tabId: 11, writerSession: "writer_a" },
+    { tabId: 12, writerSession: "writer_a" }
+  ), false);
+  assert.equal(targetContextMatches(
+    { tabId: 11, writerSession: "writer_a" },
+    { tabId: 11, writerSession: "writer_b" }
+  ), false);
+  assert.equal(targetContextMatches(
+    { tabId: 11, writerSession: "writer_a", targetEpoch: 4 },
+    { tabId: 11, writerSession: "writer_a", targetEpoch: 5 }
+  ), false);
+  assert.equal(isEnglishRevisionCurrent({
+    requestedRevision: 8,
+    currentSourceRevision: 8,
+    englishSourceRevision: 8
+  }), true);
+  assert.equal(isEnglishRevisionCurrent({
+    requestedRevision: 8,
+    currentSourceRevision: 9,
+    englishSourceRevision: 8
+  }), false);
+});
+
+test("enforces a byte limit while reading provider responses", async () => {
+  const withinLimit = new Response("你好", {
+    headers: { "Content-Type": "text/plain" }
+  });
+  assert.equal(await readLimitedText(withinLimit, 6), "你好");
+
+  const oversized = new Response("1234567", {
+    headers: { "Content-Type": "text/plain" }
+  });
+  await assert.rejects(
+    readLimitedText(oversized, 6),
+    (error) => error?.code === "response_too_large"
+  );
+});
+
+test("rejects oversized or malformed provider requests before fetch", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    throw new Error("fetch should not be called");
+  };
+
+  const config = {
+    baseUrl: "https://provider.example/v1",
+    timeoutMs: 1000,
+    capabilities: { jsonMode: false, temperature: false }
+  };
+  try {
+    await assert.rejects(
+      chatCompletion({
+        config,
+        apiKey: "test-key",
+        model: "m".repeat(241),
+        messages: [{ role: "user", content: "test" }]
+      }),
+      (error) => error?.code === "model_invalid"
+    );
+    await assert.rejects(
+      chatCompletion({
+        config,
+        apiKey: "test-key",
+        model: "model",
+        messages: [{ role: "user", content: "x".repeat(250001) }]
+      }),
+      (error) => error?.code === "payload_too_large"
+    );
+    await assert.rejects(
+      chatCompletion({
+        config,
+        apiKey: "test-key",
+        model: "model",
+        messages: [{ role: "user", content: { text: "not supported" } }]
+      }),
+      (error) => error?.code === "payload_invalid"
+    );
+    assert.equal(fetchCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("falls back once when a compatible gateway rejects JSON mode or temperature", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  let callCount = 0;
+  globalThis.fetch = async (_url, options) => {
+    requests.push(JSON.parse(options.body));
+    callCount += 1;
+    if (callCount === 1) {
+      return new Response(JSON.stringify({ error: { code: "unsupported_parameter" } }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    return new Response(JSON.stringify({
+      model: "custom-model",
+      choices: [{ finish_reason: "stop", message: { content: "{\"english\":\"Hello\",\"corrections\":[],\"ambiguous\":[]}" } }]
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+
+  try {
+    const result = await chatCompletion({
+      config: {
+        baseUrl: "https://provider.example/v1",
+        timeoutMs: 1000,
+        capabilities: { jsonMode: null, temperature: null }
+      },
+      apiKey: "test-key",
+      model: "custom-model",
+      messages: [{ role: "user", content: "test" }],
+      preferJson: true
+    });
+    assert.equal(callCount, 2);
+    assert.deepEqual(requests[0].response_format, { type: "json_object" });
+    assert.equal(requests[0].temperature, 0);
+    assert.equal("response_format" in requests[1], false);
+    assert.equal("temperature" in requests[1], false);
+    assert.deepEqual(result.capabilityPatch, { jsonMode: false, temperature: false });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("removes unsupported JSON mode and temperature in two bounded compatibility steps", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (_url, options) => {
+    const body = JSON.parse(options.body);
+    requests.push(body);
+    if (requests.length === 1) {
+      return new Response(JSON.stringify({
+        error: {
+          code: "unsupported_parameter",
+          param: "response_format",
+          message: "response_format is not supported"
+        }
+      }), { status: 400, headers: { "Content-Type": "application/json" } });
+    }
+    if (requests.length === 2) {
+      return new Response(JSON.stringify({
+        error: {
+          code: "unsupported_parameter",
+          param: "temperature",
+          message: "temperature is not supported"
+        }
+      }), { status: 400, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({
+      model: "custom-model",
+      choices: [{
+        finish_reason: "stop",
+        message: { content: '{"english":"Hello","corrections":[],"ambiguous":[]}' }
+      }]
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+
+  try {
+    const result = await chatCompletion({
+      config: {
+        baseUrl: "https://provider.example/v1",
+        timeoutMs: 1000,
+        capabilities: { jsonMode: null, temperature: null }
+      },
+      apiKey: "test-key",
+      model: "custom-model",
+      messages: [{ role: "user", content: "test" }],
+      preferJson: true
+    });
+    assert.equal(requests.length, 3);
+    assert.ok(requests[0].response_format);
+    assert.equal(requests[0].temperature, 0);
+    assert.equal("response_format" in requests[1], false);
+    assert.equal(requests[1].temperature, 0);
+    assert.equal("response_format" in requests[2], false);
+    assert.equal("temperature" in requests[2], false);
+    assert.deepEqual(result.capabilityPatch, { jsonMode: false, temperature: false });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("same-request mode returns English and back-translation in one provider call", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (_url, options) => {
+    const body = JSON.parse(options.body);
+    requests.push(body);
+    const protectedSource = body.messages.at(-1).content;
+    const token = protectedSource.match(/⟦ZH2EN_[A-F0-9]{24}_P0⟧/u)?.[0];
+    assert.ok(token, "protected token should be sent to the model");
+    return new Response(JSON.stringify({
+      model: "custom-model",
+      choices: [{
+        finish_reason: "stop",
+        message: {
+          content: JSON.stringify({
+            english: `Keep ${token} unchanged.`,
+            back_translation: `保持 ${token} 不变。`,
+            corrections: [],
+            ambiguous: []
+          })
+        }
+      }]
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+
+  try {
+    const result = await translateDraft({
+      source: "请保持 `value` 不变。",
+      config: {
+        baseUrl: "https://provider.example/v1",
+        timeoutMs: 1000,
+        capabilities: { jsonMode: true, temperature: false }
+      },
+      apiKey: "test-key",
+      model: "custom-model"
+    });
+    assert.equal(requests.length, 1);
+    assert.equal(result.backTranslationMode, BACK_TRANSLATION_MODES.SAME_REQUEST);
+    assert.match(result.english, /`value`/);
+    assert.match(result.backTranslation, /`value`/);
+    assert.match(requests[0].messages[0].content, /back_translation/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("same-request mode repairs a missing back-translation once", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (_url, options) => {
+    const body = JSON.parse(options.body);
+    requests.push(body);
+    const content = requests.length === 1
+      ? JSON.stringify({ english: "Hello.", corrections: [], ambiguous: [] })
+      : JSON.stringify({
+          english: "Hello.",
+          back_translation: "你好。",
+          corrections: [],
+          ambiguous: []
+        });
+    return new Response(JSON.stringify({
+      choices: [{ finish_reason: "stop", message: { content } }]
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+
+  try {
+    const result = await translateDraft({
+      source: "你好。",
+      config: {
+        baseUrl: "https://provider.example/v1",
+        timeoutMs: 1000,
+        capabilities: { jsonMode: true, temperature: false }
+      },
+      apiKey: "test-key",
+      model: "custom-model"
+    });
+    assert.equal(requests.length, 2);
+    assert.equal(result.backTranslation, "你好。");
+    assert.match(requests[1].messages[0].content, /back_translation.*为空/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("independent mode keeps the primary translation response English-only", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestBody = null;
+  globalThis.fetch = async (_url, options) => {
+    requestBody = JSON.parse(options.body);
+    return new Response(JSON.stringify({
+      choices: [{
+        finish_reason: "stop",
+        message: { content: JSON.stringify({ english: "Hello.", corrections: [], ambiguous: [] }) }
+      }]
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+
+  try {
+    const result = await translateDraft({
+      source: "你好。",
+      config: {
+        baseUrl: "https://provider.example/v1",
+        timeoutMs: 1000,
+        capabilities: { jsonMode: true, temperature: false }
+      },
+      apiKey: "test-key",
+      model: "custom-model",
+      backTranslationMode: BACK_TRANSLATION_MODES.INDEPENDENT
+    });
+    assert.equal(result.backTranslation, "");
+    assert.equal(result.backTranslationMode, BACK_TRANSLATION_MODES.INDEPENDENT);
+    assert.doesNotMatch(requestBody.messages[0].content, /"back_translation"/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("backtranslation sends only the English draft as user content", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestBody = null;
+  globalThis.fetch = async (_url, options) => {
+    requestBody = JSON.parse(options.body);
+    return new Response(JSON.stringify({
+      choices: [{ finish_reason: "stop", message: { content: "请检查这段代码。" } }]
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+
+  try {
+    const result = await backTranslate({
+      english: "Please review this code.",
+      config: {
+        baseUrl: "https://provider.example/v1",
+        timeoutMs: 1000,
+        capabilities: { jsonMode: false, temperature: false }
+      },
+      apiKey: "test-key",
+      model: "custom-model"
+    });
+    assert.equal(result.chinese, "请检查这段代码。");
+    assert.equal(requestBody.messages.at(-1).role, "user");
+    assert.equal(requestBody.messages.at(-1).content, "Please review this code.");
+    assert.equal(requestBody.messages.some((message) => message.content.includes("原始中文草稿")), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+
+test("rejects tool-call completions even when finish_reason is stop", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    choices: [{
+      finish_reason: "stop",
+      message: {
+        content: "{\"english\":\"unsafe\"}",
+        tool_calls: [{ id: "call_1", type: "function" }]
+      }
+    }]
+  }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" }
+  });
+
+  try {
+    await assert.rejects(
+      chatCompletion({
+        config: {
+          baseUrl: "https://provider.example/v1",
+          timeoutMs: 1000,
+          capabilities: { jsonMode: false, temperature: false }
+        },
+        apiKey: "test-key",
+        model: "custom-model",
+        messages: [{ role: "user", content: "test" }]
+      }),
+      (error) => error?.code === "incomplete_response"
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("retries literally when the model proposes an unsafe correction", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  let call = 0;
+  globalThis.fetch = async (_url, options) => {
+    requests.push(JSON.parse(options.body));
+    call += 1;
+    const content = call === 1
+      ? JSON.stringify({
+          english: "Do delete it.",
+          back_translation: "把它删除。",
+          corrections: [{ original: "不要", interpreted_as: "要", reason: "wrong" }],
+          ambiguous: []
+        })
+      : JSON.stringify({
+          english: "Do not delete it.",
+          back_translation: "不要删除它。",
+          corrections: [],
+          ambiguous: []
+        });
+    return new Response(JSON.stringify({
+      choices: [{ finish_reason: "stop", message: { content } }]
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+
+  try {
+    const result = await translateDraft({
+      source: "不要删除它",
+      config: {
+        baseUrl: "https://provider.example/v1",
+        timeoutMs: 1000,
+        capabilities: { jsonMode: true, temperature: false }
+      },
+      apiKey: "test-key",
+      model: "custom-model"
+    });
+    assert.equal(call, 2);
+    assert.equal(result.english, "Do not delete it.");
+    assert.match(requests[1].messages[0].content, /do not correct or reinterpret any source text/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("enforces a user's literal-retranslation choice locally", async () => {
+  const originalFetch = globalThis.fetch;
+  let call = 0;
+  globalThis.fetch = async () => {
+    call += 1;
+    const content = call === 1
+      ? JSON.stringify({
+          english: "Delete this function.",
+          back_translation: "删除这个函数。",
+          corrections: [{ original: "删出", interpreted_as: "删除", reason: "typo" }],
+          ambiguous: []
+        })
+      : JSON.stringify({
+          english: "Remove-out this function literally.",
+          back_translation: "按字面移出这个函数。",
+          corrections: [],
+          ambiguous: []
+        });
+    return new Response(JSON.stringify({
+      choices: [{ finish_reason: "stop", message: { content } }]
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+
+  try {
+    const result = await translateDraft({
+      source: "请删出这个函数",
+      config: {
+        baseUrl: "https://provider.example/v1",
+        timeoutMs: 1000,
+        capabilities: { jsonMode: true, temperature: false }
+      },
+      apiKey: "test-key",
+      model: "custom-model",
+      literalFragments: ["删出"]
+    });
+    assert.equal(call, 2);
+    assert.equal(result.corrections.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("rolls back staged secrets when configuration storage fails", async () => {
+  const originalChrome = globalThis.chrome;
+  const local = new Map([[STORAGE_KEYS.LOCAL_SECRET, "old-local"]]);
+  const session = new Map([[STORAGE_KEYS.SESSION_SECRET, "old-session"]]);
+  let failSettingsWrite = true;
+
+  const makeArea = (map, isLocal = false) => ({
+    async get(keys) {
+      const requested = Array.isArray(keys) ? keys : [keys];
+      return Object.fromEntries(requested.filter((key) => map.has(key)).map((key) => [key, map.get(key)]));
+    },
+    async set(values) {
+      if (isLocal && failSettingsWrite && Object.hasOwn(values, STORAGE_KEYS.SETTINGS)) {
+        failSettingsWrite = false;
+        throw new Error("simulated settings failure");
+      }
+      for (const [key, value] of Object.entries(values)) map.set(key, value);
+    },
+    async remove(keys) {
+      for (const key of Array.isArray(keys) ? keys : [keys]) map.delete(key);
+    }
+  });
+
+  globalThis.chrome = {
+    storage: {
+      local: makeArea(local, true),
+      session: makeArea(session)
+    }
+  };
+
+  try {
+    await assert.rejects(
+      saveConfiguration({ autoSync: true }, { keyStorage: "local" }, "new-secret"),
+      /simulated settings failure/
+    );
+    assert.equal(local.get(STORAGE_KEYS.LOCAL_SECRET), "old-local");
+    assert.equal(session.get(STORAGE_KEYS.SESSION_SECRET), "old-session");
+    await assert.rejects(
+      saveConfiguration({ autoSync: true }, { keyStorage: "local" }, "k".repeat(8_193)),
+      /API Key 异常过长/
+    );
+    assert.equal(local.get(STORAGE_KEYS.LOCAL_SECRET), "old-local");
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("binds a saved API key to the exact Provider generation and request destination", async () => {
+  const originalChrome = globalThis.chrome;
+  const local = new Map();
+  const session = new Map();
+  const makeArea = (map) => ({
+    async get(keys) {
+      const requested = Array.isArray(keys) ? keys : [keys];
+      return Object.fromEntries(
+        requested.filter((key) => map.has(key)).map((key) => [key, map.get(key)])
+      );
+    },
+    async set(values) {
+      for (const [key, value] of Object.entries(values)) map.set(key, value);
+    },
+    async remove(keys) {
+      for (const key of Array.isArray(keys) ? keys : [keys]) map.delete(key);
+    }
+  });
+  globalThis.chrome = {
+    storage: {
+      local: makeArea(local),
+      session: makeArea(session)
+    }
+  };
+
+  try {
+    const legacyProvider = {
+      preset: "custom",
+      name: "Gateway A",
+      baseUrl: "https://gateway-a.example/v1",
+      keyStorage: "local",
+      authHeader: "Authorization",
+      authPrefix: "Bearer",
+      extraHeaders: { "X-Project": "alpha" }
+    };
+    local.set(STORAGE_KEYS.PROVIDER, legacyProvider);
+    local.set(STORAGE_KEYS.LOCAL_SECRET, "legacy-key-for-a");
+    assert.equal(await getSecretForProvider(legacyProvider), "legacy-key-for-a");
+
+    const first = await saveConfiguration(
+      { autoSync: true },
+      {
+        ...legacyProvider,
+        credentialId: "credential-a"
+      },
+      "key-for-a"
+    );
+    assert.equal(await getSecretForProvider(first.provider), "key-for-a");
+    assert.equal(
+      await getSecretForProvider(legacyProvider),
+      "",
+      "a legacy panel must not read a newly rotated key for the same endpoint"
+    );
+
+    const sameCredentialWrongDestination = {
+      ...first.provider,
+      baseUrl: "https://gateway-b.example/v1"
+    };
+    assert.notEqual(
+      providerCredentialBinding(first.provider),
+      providerCredentialBinding(sameCredentialWrongDestination)
+    );
+    assert.equal(await getSecretForProvider(sameCredentialWrongDestination), "");
+
+    const sameDestinationWrongRouteHeader = {
+      ...first.provider,
+      extraHeaders: { "x-project": "beta" }
+    };
+    assert.equal(await getSecretForProvider(sameDestinationWrongRouteHeader), "");
+
+    const sameGenerationWrongStorageArea = {
+      ...first.provider,
+      keyStorage: "session"
+    };
+    assert.equal(await getSecretForProvider(sameGenerationWrongStorageArea), "");
+
+    const second = await saveConfiguration(
+      { autoSync: true },
+      {
+        preset: "custom",
+        name: "Gateway B",
+        baseUrl: "https://gateway-b.example/v1",
+        keyStorage: "local",
+        authHeader: "Authorization",
+        authPrefix: "Bearer",
+        credentialId: "credential-b"
+      },
+      "key-for-b"
+    );
+    assert.equal(await getSecretForProvider(first.provider), "");
+    assert.equal(await getSecretForProvider(second.provider), "key-for-b");
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+
+test("window-scoped session drafts stay isolated and legacy state migrates once", async () => {
+  const originalChrome = globalThis.chrome;
+  const session = new Map();
+  const area = {
+    async get(keys) {
+      const requested = Array.isArray(keys) ? keys : [keys];
+      return Object.fromEntries(requested.filter((key) => session.has(key)).map((key) => [key, session.get(key)]));
+    },
+    async set(values) {
+      for (const [key, value] of Object.entries(values)) session.set(key, value);
+    },
+    async remove(keys) {
+      for (const key of Array.isArray(keys) ? keys : [keys]) session.delete(key);
+    }
+  };
+  globalThis.chrome = { storage: { session: area } };
+
+  try {
+    await saveActiveDraft({ source: "窗口一" }, "window-1");
+    await saveActiveDraft({ source: "窗口二" }, "window-2");
+    assert.equal((await loadDraftState("window-1")).activeDraft.source, "窗口一");
+    assert.equal((await loadDraftState("window-2")).activeDraft.source, "窗口二");
+    assert.notEqual(
+      scopedSessionKey(STORAGE_KEYS.ACTIVE_DRAFT, "window-1"),
+      scopedSessionKey(STORAGE_KEYS.ACTIVE_DRAFT, "window-2")
+    );
+
+    session.clear();
+    session.set(STORAGE_KEYS.ACTIVE_DRAFT, { source: "旧版草稿" });
+    session.set(STORAGE_KEYS.HISTORY, [{ source: "旧历史" }]);
+    const migrated = await loadDraftState("window-3");
+    assert.equal(migrated.activeDraft.source, "旧版草稿");
+    assert.equal(migrated.history[0].source, "旧历史");
+    assert.equal(session.has(STORAGE_KEYS.ACTIVE_DRAFT), false);
+    assert.equal(
+      session.get(scopedSessionKey(STORAGE_KEYS.ACTIVE_DRAFT, "window-3")).source,
+      "旧版草稿"
+    );
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("behavior-only settings saves never rewrite a Provider snapshot", async () => {
+  const originalChrome = globalThis.chrome;
+  const storedProvider = {
+    name: "Provider from another window",
+    baseUrl: "https://current.example/v1",
+    credentialId: "credential-current"
+  };
+  const local = new Map([[STORAGE_KEYS.PROVIDER, structuredClone(storedProvider)]]);
+  globalThis.chrome = {
+    storage: {
+      local: {
+        async get(keys) {
+          const requested = Array.isArray(keys) ? keys : [keys];
+          return Object.fromEntries(requested.filter((key) => local.has(key)).map((key) => [key, local.get(key)]));
+        },
+        async set(values) {
+          for (const [key, value] of Object.entries(values)) local.set(key, structuredClone(value));
+        },
+        async remove(keys) {
+          for (const key of Array.isArray(keys) ? keys : [keys]) local.delete(key);
+        }
+      }
+    }
+  };
+  try {
+    await saveBehaviorSettings({ autoSync: false, debounceMs: 900 });
+    assert.deepEqual(local.get(STORAGE_KEYS.PROVIDER), storedProvider);
+    assert.equal(local.get(STORAGE_KEYS.SETTINGS).autoSync, false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("configuration save rolls back settings and both secrets when stale-secret removal fails", async () => {
+  const originalChrome = globalThis.chrome;
+  const oldSettings = { autoSync: false, backTranslationMode: "independent" };
+  const oldProvider = { keyStorage: "local", name: "Old provider" };
+  const local = new Map([
+    [STORAGE_KEYS.LOCAL_SECRET, "old-local"],
+    [STORAGE_KEYS.SETTINGS, oldSettings],
+    [STORAGE_KEYS.PROVIDER, oldProvider]
+  ]);
+  const session = new Map([[STORAGE_KEYS.SESSION_SECRET, "old-session"]]);
+  let failStaleRemoval = true;
+
+  const makeArea = (map, isLocal = false) => ({
+    async get(keys) {
+      const requested = Array.isArray(keys) ? keys : [keys];
+      return Object.fromEntries(requested.filter((key) => map.has(key)).map((key) => [key, map.get(key)]));
+    },
+    async set(values) {
+      for (const [key, value] of Object.entries(values)) map.set(key, value);
+    },
+    async remove(keys) {
+      const requested = Array.isArray(keys) ? keys : [keys];
+      if (isLocal && failStaleRemoval && requested.includes(STORAGE_KEYS.LOCAL_SECRET)) {
+        failStaleRemoval = false;
+        throw new Error("simulated stale-secret removal failure");
+      }
+      for (const key of requested) map.delete(key);
+    }
+  });
+
+  globalThis.chrome = {
+    storage: {
+      local: makeArea(local, true),
+      session: makeArea(session)
+    }
+  };
+
+  try {
+    await assert.rejects(
+      saveConfiguration(
+        { autoSync: true, backTranslationMode: "same_request" },
+        { keyStorage: "session", name: "New provider" },
+        "new-session-secret"
+      ),
+      /simulated stale-secret removal failure/
+    );
+    assert.equal(local.get(STORAGE_KEYS.LOCAL_SECRET), "old-local");
+    assert.equal(session.get(STORAGE_KEYS.SESSION_SECRET), "old-session");
+    assert.deepEqual(local.get(STORAGE_KEYS.SETTINGS), oldSettings);
+    assert.deepEqual(local.get(STORAGE_KEYS.PROVIDER), oldProvider);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("normalizes malformed stored settings and provider data before runtime use", () => {
+  const settings = normalizeStoredSettings({
+    autoSync: "yes",
+    debounceMs: -100,
+    sentenceEndDelayMs: 999999,
+    backTranslationMode: "unknown",
+    requestTimeoutMs: "not-a-number",
+    protectedTerms: "Claude"
+  });
+  assert.equal(settings.autoSync, true);
+  assert.equal(settings.debounceMs, 200);
+  assert.equal(settings.sentenceEndDelayMs, 1000);
+  assert.equal(settings.backTranslationMode, BACK_TRANSLATION_MODES.SAME_REQUEST);
+  assert.equal(settings.requestTimeoutMs, 20000);
+  assert.deepEqual(settings.protectedTerms, []);
+
+  const provider = normalizeStoredProvider({
+    preset: "invalid",
+    name: 123,
+    keyStorage: "cloud",
+    modelTranslate: "m".repeat(400),
+    extraHeaders: ["bad"],
+    capabilities: { jsonMode: "yes", temperature: false }
+  });
+  assert.equal(provider.preset, "openai");
+  assert.equal(provider.name, "OpenAI");
+  assert.equal(provider.keyStorage, "local");
+  assert.equal([...provider.modelTranslate].length, 240);
+  assert.deepEqual(provider.extraHeaders, {});
+  assert.deepEqual(provider.capabilities, { jsonMode: null, temperature: false });
+
+  const providerWithDangerousKeys = normalizeStoredProvider({
+    authHeader: "Content-Type",
+    authPrefix: "Bearer\nInjected",
+    extraHeaders: JSON.parse('{"__proto__":"bad","constructor":"bad","prototype":"bad","Cookie":"secret","Content-Type":"text/plain","Authorization":"other","X-Backup-Token":"secret","X-Project":"demo"}')
+  });
+  assert.equal(providerWithDangerousKeys.authHeader, "Authorization");
+  assert.equal(providerWithDangerousKeys.authPrefix, "Bearer");
+  assert.deepEqual(providerWithDangerousKeys.extraHeaders, { "X-Project": "demo" });
+});
+
+test("independent back-translation retries once when the first output is not Chinese", async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    const content = calls === 1 ? "This is still English." : "这是中文回译。";
+    return new Response(JSON.stringify({
+      choices: [{ finish_reason: "stop", message: { content } }]
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  try {
+    const result = await backTranslate({
+      english: "This is the English translation.",
+      sourceForWarnings: "这是用于测试的中文原稿。",
+      config: {
+        baseUrl: "https://provider.example/v1",
+        timeoutMs: 1000,
+        capabilities: { jsonMode: false, temperature: false }
+      },
+      apiKey: "test-key",
+      model: "custom-model"
+    });
+    assert.equal(calls, 2);
+    assert.equal(result.chinese, "这是中文回译。");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("preserves JSON mode when only temperature is rejected", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (_url, options) => {
+    requests.push(JSON.parse(options.body));
+    if (requests.length === 1) {
+      return new Response(JSON.stringify({
+        error: { code: "unsupported_parameter", param: "temperature", message: "temperature is not supported" }
+      }), { status: 400, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({
+      choices: [{ finish_reason: "stop", message: { content: '{"english":"Hello"}' } }]
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  try {
+    const result = await chatCompletion({
+      config: {
+        baseUrl: "https://provider.example/v1",
+        timeoutMs: 1000,
+        capabilities: { jsonMode: null, temperature: null }
+      },
+      apiKey: "test-key",
+      model: "custom-model",
+      messages: [{ role: "user", content: "test" }],
+      preferJson: true
+    });
+    assert.equal(requests.length, 2);
+    assert.deepEqual(requests[1].response_format, { type: "json_object" });
+    assert.equal("temperature" in requests[1], false);
+    assert.deepEqual(result.capabilityPatch, { jsonMode: true, temperature: false });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("does not retry arbitrary invalid requests and rejects refusal content even when text exists", async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return new Response(JSON.stringify({ error: { code: "model_not_found" } }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+  try {
+    await assert.rejects(
+      chatCompletion({
+        config: {
+          baseUrl: "https://provider.example/v1",
+          timeoutMs: 1000,
+          capabilities: { jsonMode: null, temperature: null }
+        },
+        apiKey: "test-key",
+        model: "missing-model",
+        messages: [{ role: "user", content: "test" }],
+        preferJson: true
+      }),
+      (error) => error?.code === "model_not_found"
+    );
+    assert.equal(calls, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    choices: [{
+      finish_reason: "stop",
+      message: { content: "apparently usable text", refusal: "cannot comply" }
+    }]
+  }), { status: 200, headers: { "Content-Type": "application/json" } });
+  try {
+    await assert.rejects(
+      chatCompletion({
+        config: {
+          baseUrl: "https://provider.example/v1",
+          timeoutMs: 1000,
+          capabilities: { jsonMode: false, temperature: false }
+        },
+        apiKey: "test-key",
+        model: "custom-model",
+        messages: [{ role: "user", content: "test" }]
+      }),
+      (error) => error?.code === "model_refusal"
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+
+test("protects user text that already looks like a plugin placeholder", () => {
+  const source = "请原样显示 ⟦ZH2EN_ABCD_P0⟧，不要解释。";
+  const protection = protectText(source, []);
+  assert.equal(protection.placeholders.length, 1);
+  assert.equal(protection.placeholders[0].kind, "placeholder_literal");
+  const output = `Show ${protection.placeholders[0].token} exactly, without explanation.`;
+  assert.deepEqual(
+    validatePlaceholderIntegrity(output, protection.placeholders, protection.prefix).errors,
+    []
+  );
+  assert.match(restorePlaceholders(output, protection.placeholders), /⟦ZH2EN_ABCD_P0⟧/u);
+});
+
+test("protects the whole code block when it contains a literal plugin-looking token", () => {
+  const source = "```js\nconst token = '⟦ZH2EN_ABCD_P0⟧';\nconsole.log(token);\n```";
+  const protectedResult = protectText(source);
+
+  assert.equal(protectedResult.placeholders.length, 1);
+  assert.equal(protectedResult.placeholders[0].kind, "fenced_code");
+  assert.equal(protectedResult.placeholders[0].value, source);
+  assert.equal(restorePlaceholders(protectedResult.protectedText, protectedResult.placeholders), source);
+});
+
+test("rejects ambiguous, duplicate, or overlapping typo claims", () => {
+  const repeatedSource = validateTranslationPayload({
+    english: "Delete A, then delete B.",
+    corrections: [{ original: "删出", interpreted_as: "删除", reason: "claim" }],
+    ambiguous: []
+  }, "请删出甲，再删出乙");
+  assert.ok(repeatedSource.errors.some((item) => item.includes("笔误")));
+
+  const overlappingOccurrence = validateTranslationPayload({
+    english: "Ha-ha.",
+    corrections: [{ original: "哈哈", interpreted_as: "呵呵", reason: "claim" }],
+    ambiguous: []
+  }, "哈哈哈");
+  assert.ok(overlappingOccurrence.errors.some((item) => item.includes("笔误")));
+
+  const duplicateClaims = validateTranslationPayload({
+    english: "Delete it.",
+    corrections: [
+      { original: "删出", interpreted_as: "删除", reason: "first" },
+      { original: "删出", interpreted_as: "删除", reason: "duplicate" }
+    ],
+    ambiguous: []
+  }, "请删出它");
+  assert.ok(duplicateClaims.errors.some((item) => item.includes("笔误")));
+
+  const overlappingClaims = validateTranslationPayload({
+    english: "Delete it.",
+    corrections: [
+      { original: "删出", interpreted_as: "删除", reason: "first" },
+      { original: "出", interpreted_as: "除", reason: "overlap" }
+    ],
+    ambiguous: []
+  }, "请删出它");
+  assert.ok(overlappingClaims.errors.some((item) => item.includes("笔误")));
+});
+
+test("does not create false numeric warnings from random placeholder digits", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestBody = null;
+  globalThis.fetch = async (_url, options) => {
+    requestBody = JSON.parse(options.body);
+    const protectedSource = requestBody.messages.at(-1).content;
+    const token = protectedSource.match(/⟦ZH2EN_[A-F0-9]{24}_P0⟧/u)?.[0];
+    assert.ok(token);
+    return new Response(JSON.stringify({
+      choices: [{
+        finish_reason: "stop",
+        message: {
+          content: JSON.stringify({
+            english: `Visit ${token} and keep version 3.`,
+            back_translation: `请访问 ${token} 并保留版本 3。`,
+            corrections: [],
+            ambiguous: []
+          })
+        }
+      }]
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+
+  try {
+    const result = await translateDraft({
+      source: "请访问 https://example.com/v2 并保留版本 3。",
+      config: {
+        baseUrl: "https://provider.example/v1",
+        timeoutMs: 1000,
+        capabilities: { jsonMode: true, temperature: false }
+      },
+      apiKey: "test-key",
+      model: "custom-model"
+    });
+    assert.equal(result.english, "Visit https://example.com/v2 and keep version 3.");
+    assert.equal(
+      result.warnings.some((item) => item.includes("数字")),
+      false
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("validates same-request Chinese only after protected content is restored", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, options) => {
+    const body = JSON.parse(options.body);
+    const token = body.messages.at(-1).content.match(/⟦ZH2EN_[A-F0-9]{24}_P0⟧/u)?.[0];
+    assert.ok(token);
+    return new Response(JSON.stringify({
+      choices: [{
+        finish_reason: "stop",
+        message: {
+          content: JSON.stringify({
+            english: token,
+            back_translation: token,
+            corrections: [],
+            ambiguous: []
+          })
+        }
+      }]
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+
+  try {
+    const source = "```text\n这是受保护的中文内容\n```";
+    const result = await translateDraft({
+      source,
+      config: {
+        baseUrl: "https://provider.example/v1",
+        timeoutMs: 1000,
+        capabilities: { jsonMode: true, temperature: false }
+      },
+      apiKey: "test-key",
+      model: "custom-model"
+    });
+    assert.equal(result.english, source);
+    assert.equal(result.backTranslation, source);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("independent back-translation protects URLs and code without sending source Chinese", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestBody = null;
+  globalThis.fetch = async (_url, options) => {
+    requestBody = JSON.parse(options.body);
+    const protectedEnglish = requestBody.messages.at(-1).content;
+    const tokens = protectedEnglish.match(/⟦ZH2EN_[A-F0-9]{24}_P\d+⟧/gu) ?? [];
+    assert.equal(tokens.length, 2);
+    return new Response(JSON.stringify({
+      choices: [{
+        finish_reason: "stop",
+        message: { content: `请使用 ${tokens[0]} 并保持 ${tokens[1]} 不变。` }
+      }]
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+
+  try {
+    const result = await backTranslate({
+      english: "Use https://example.com/v2 and keep `alpha()` unchanged.",
+      sourceForWarnings: "请使用链接并保持代码不变。",
+      config: {
+        baseUrl: "https://provider.example/v1",
+        timeoutMs: 1000,
+        capabilities: { jsonMode: false, temperature: false }
+      },
+      apiKey: "test-key",
+      model: "custom-model"
+    });
+    assert.equal(
+      result.chinese,
+      "请使用 https://example.com/v2 并保持 `alpha()` 不变。"
+    );
+    assert.doesNotMatch(requestBody.messages.at(-1).content, /请使用链接/u);
+    assert.doesNotMatch(requestBody.messages.at(-1).content, /https:\/\/example\.com\/v2/u);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("rejects structured refusal and non-text response parts", async () => {
+  const originalFetch = globalThis.fetch;
+  const config = {
+    baseUrl: "https://provider.example/v1",
+    timeoutMs: 1000,
+    capabilities: { jsonMode: false, temperature: false }
+  };
+  try {
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      choices: [{
+        finish_reason: "stop",
+        message: {
+          content: [
+            { type: "refusal", refusal: "cannot comply" },
+            { type: "text", text: "apparently usable text" }
+          ]
+        }
+      }]
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+    await assert.rejects(
+      chatCompletion({
+        config,
+        apiKey: "test-key",
+        model: "custom-model",
+        messages: [{ role: "user", content: "test" }]
+      }),
+      (error) => error?.code === "model_refusal"
+    );
+
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      choices: [{
+        finish_reason: "stop",
+        message: {
+          content: [
+            { type: "image_url", image_url: { url: "data:image/png;base64,AA==" } },
+            { type: "text", text: "apparently usable text" }
+          ]
+        }
+      }]
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+    await assert.rejects(
+      chatCompletion({
+        config,
+        apiKey: "test-key",
+        model: "custom-model",
+        messages: [{ role: "user", content: "test" }]
+      }),
+      (error) => error?.code === "incomplete_response"
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("distinguishes a missing model returned as HTTP 404 from a missing endpoint", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      error: { code: "model_not_found", message: "The model 'missing-model' does not exist" }
+    }), { status: 404, headers: { "Content-Type": "application/json" } });
+    await assert.rejects(
+      chatCompletion({
+        config: {
+          baseUrl: "https://provider.example/v1",
+          timeoutMs: 1000,
+          capabilities: { jsonMode: false, temperature: false }
+        },
+        apiKey: "test-key",
+        model: "missing-model",
+        messages: [{ role: "user", content: "test" }]
+      }),
+      (error) => error?.code === "model_not_found"
+    );
+
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      error: { code: "not_found", message: "Requested model is unknown and not available" }
+    }), { status: 404, headers: { "Content-Type": "application/json" } });
+    await assert.rejects(
+      chatCompletion({
+        config: {
+          baseUrl: "https://provider.example/v1",
+          timeoutMs: 1000,
+          capabilities: { jsonMode: false, temperature: false }
+        },
+        apiKey: "test-key",
+        model: "missing-model",
+        messages: [{ role: "user", content: "test" }]
+      }),
+      (error) => error?.code === "model_not_found"
+    );
+
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      error: { code: "not_found", message: "Route not found" }
+    }), { status: 404, headers: { "Content-Type": "application/json" } });
+    await assert.rejects(
+      chatCompletion({
+        config: {
+          baseUrl: "https://provider.example/v1",
+          timeoutMs: 1000,
+          capabilities: { jsonMode: false, temperature: false }
+        },
+        apiKey: "test-key",
+        model: "custom-model",
+        messages: [{ role: "user", content: "test" }]
+      }),
+      (error) => error?.code === "endpoint_not_found"
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("bounds and sanitizes persisted draft, history, and diagnostics state", () => {
+  const draft = normalizeStoredDraft({
+    id: 42,
+    source: "源".repeat(260_000),
+    english: "e".repeat(110_000),
+    backTranslation: "回".repeat(110_000),
+    corrections: null,
+    ambiguities: "bad",
+    warnings: ["warning", "warning", 123],
+    sourceRevision: -10,
+    englishSourceRevision: "bad",
+    createdAt: Infinity
+  });
+  assert.equal(draft.id, "");
+  assert.equal([...draft.source].length, 250_000);
+  assert.equal(draft.english.length, 100_000);
+  assert.equal([...draft.backTranslation].length, 100_000);
+  assert.deepEqual(draft.corrections, []);
+  assert.deepEqual(draft.ambiguities, []);
+  assert.deepEqual(draft.warnings, ["warning"]);
+  assert.equal(draft.sourceRevision, 0);
+  assert.equal(draft.englishSourceRevision, null);
+  assert.ok(Number.isFinite(draft.createdAt));
+
+  const history = normalizeStoredHistory(Array.from({ length: 30 }, (_, index) => ({
+    id: `item-${index}`,
+    source: "源".repeat(50_000),
+    english: "e".repeat(100_000),
+    backTranslation: "回".repeat(100_000),
+    note: "n".repeat(800)
+  })));
+  const totalChars = history.reduce(
+    (sum, item) => sum + item.source.length + item.english.length + item.backTranslation.length + item.note.length,
+    0
+  );
+  assert.ok(history.length > 0 && history.length <= 20);
+  assert.ok(totalChars <= 1_500_000);
+
+  const diagnostics = normalizeStoredDiagnostics(Array.from({ length: 100 }, (_, index) => ({
+    timestamp: index % 2 === 0 ? Date.now() : "bad",
+    message: index === 0 ? "x".repeat(300) : `message-${index}`
+  })));
+  assert.equal(diagnostics.length, 80);
+  assert.equal(diagnostics[0].message.length, 240);
+  assert.ok(diagnostics.every((item) => Number.isFinite(item.timestamp)));
+});

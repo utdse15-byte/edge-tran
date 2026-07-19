@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>中文→英文输入助手</title>
+  <link rel="stylesheet" href="panel.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-header">
+      <div>
+        <h1>中文 → 英文</h1>
+        <p id="providerSummary" class="muted">尚未配置 Provider</p>
+      </div>
+      <div class="header-actions">
+        <button id="historyButton" class="icon-button" type="button" title="最近草稿" aria-label="最近草稿">↶</button>
+        <button id="settingsButton" class="icon-button" type="button" title="设置" aria-label="设置">⚙</button>
+      </div>
+    </header>
+
+    <section class="target-strip" aria-label="Claude 目标标签页">
+      <div class="target-copy">
+        <span id="targetDot" class="dot dot-off"></span>
+        <div>
+          <strong id="targetLabel">未绑定 Claude</strong>
+          <div id="targetDetail" class="muted compact">打开 claude.ai 后绑定当前标签页</div>
+        </div>
+      </div>
+      <button id="bindButton" class="secondary-button" type="button">绑定当前页</button>
+    </section>
+
+    <div id="statusBar" class="status-bar" role="status" aria-live="polite">准备就绪</div>
+    <div id="staleBanner" class="banner warning hidden" role="alert"></div>
+    <div id="manualBanner" class="banner danger hidden" role="alert">
+      <strong>检测到你直接修改了 Claude 中的英文</strong>
+      <p>自动覆盖已暂停。选择如何处理当前人工版本。</p>
+      <div class="button-row wrap">
+        <button id="keepManualButton" class="secondary-button" type="button">保留人工英文</button>
+        <button id="regenerateButton" class="primary-button" type="button">用最新中文重译</button>
+        <button id="baselineButton" class="secondary-button" type="button">作为核对基线</button>
+      </div>
+    </div>
+
+    <main>
+      <section class="editor-card source-card">
+        <div class="section-heading">
+          <label for="sourceText">中文原稿</label>
+          <div class="heading-actions">
+            <span id="sourceCount" class="counter">0</span>
+            <label class="switch-label" title="自动翻译并同步">
+              <input id="autoSyncToggle" type="checkbox" checked>
+              <span>自动</span>
+            </label>
+          </div>
+        </div>
+        <textarea id="sourceText" rows="8" maxlength="250000" spellcheck="false" autocomplete="off" placeholder="在这里输入中文。中文只存在于扩展侧边栏，不进入 Claude 页面；完整英文才会写入。"></textarea>
+        <div class="button-row">
+          <button id="translateButton" class="primary-button" type="button">立即翻译</button>
+          <button id="pauseButton" class="secondary-button" type="button">暂停</button>
+          <button id="clearDraftButton" class="ghost-button" type="button">清空</button>
+        </div>
+        <p id="longTextHint" class="inline-hint hidden">文本较长，已停止自动重译；点击“翻译整段”。</p>
+      </section>
+
+      <section id="correctionSection" class="notice-card hidden">
+        <h2>疑似明显笔误</h2>
+        <div id="correctionList"></div>
+      </section>
+
+      <section id="ambiguitySection" class="notice-card hidden">
+        <h2>需要核对的歧义</h2>
+        <div id="ambiguityList"></div>
+      </section>
+
+      <section id="warningSection" class="notice-card warning-card hidden">
+        <h2>检查提示</h2>
+        <ul id="warningList"></ul>
+      </section>
+
+      <section class="editor-card">
+        <div class="section-heading">
+          <label for="englishText">英文预览</label>
+          <span id="syncBadge" class="badge">未生成</span>
+        </div>
+        <textarea id="englishText" rows="7" readonly spellcheck="false" placeholder="英文译文会显示在这里"></textarea>
+        <div class="button-row">
+          <button id="syncButton" class="primary-button" type="button">同步到 Claude</button>
+          <button id="copyEnglishButton" class="secondary-button" type="button">复制英文</button>
+        </div>
+      </section>
+
+      <section class="editor-card">
+        <div class="section-heading">
+          <label id="backLabel" for="backText">AI 同请求回译中文</label>
+          <span id="backBadge" class="badge">未生成</span>
+        </div>
+        <textarea id="backText" rows="6" readonly spellcheck="false" placeholder="同一次模型响应会同时返回英文和中文回译"></textarea>
+        <p id="backModeHint" class="inline-hint neutral-hint">同请求回译可减少一次 API 调用，但它是模型自检，不等同于独立验证。</p>
+      </section>
+    </main>
+
+    <footer class="app-footer">
+      <button id="diagnosticsButton" class="ghost-button" type="button">页面诊断</button>
+      <span>Ctrl+Enter 立即翻译 · Esc 暂停/恢复</span>
+    </footer>
+  </div>
+
+  <dialog id="settingsDialog" class="modal">
+    <form id="settingsForm">
+      <div class="modal-header">
+        <div>
+          <h2>Provider 与行为设置</h2>
+          <p class="muted">Key 只保存在扩展可信上下文中，不会进入内容脚本。</p>
+        </div>
+        <button class="icon-button close-dialog" type="button" aria-label="关闭">×</button>
+      </div>
+
+      <fieldset>
+        <legend>供应商</legend>
+        <label>预置模板
+          <select id="providerPreset">
+            <option value="openai">OpenAI</option>
+            <option value="xai">xAI / Grok</option>
+            <option value="custom">自定义 OpenAI 兼容端点</option>
+          </select>
+        </label>
+        <label>显示名称
+          <input id="providerName" type="text" maxlength="80" autocomplete="off">
+        </label>
+        <label>Base URL
+          <input id="baseUrl" type="url" inputmode="url" autocomplete="off" placeholder="https://api.example.com/v1">
+        </label>
+        <div class="two-columns">
+          <label>鉴权 Header
+            <input id="authHeader" type="text" autocomplete="off" value="Authorization">
+          </label>
+          <label>Key 前缀
+            <input id="authPrefix" type="text" autocomplete="off" value="Bearer" placeholder="Bearer；留空则直接使用 Key">
+          </label>
+        </div>
+        <label>API Key
+          <input id="apiKey" type="password" autocomplete="new-password" placeholder="粘贴新 Key；留空则保留已保存的 Key">
+        </label>
+        <label>Key 保存方式
+          <select id="keyStorage">
+            <option value="local">本地持久（关闭 Edge 后仍保留）</option>
+            <option value="session">仅本次 Edge 会话</option>
+          </select>
+        </label>
+        <label>额外请求头（JSON，可选）
+          <textarea id="extraHeaders" rows="3" spellcheck="false" placeholder='{"X-Project":"my-project"}'></textarea>
+        </label>
+        <div class="button-row wrap">
+          <button id="detectModelsButton" class="secondary-button" type="button">检测模型</button>
+          <label class="inline-checkbox"><input id="showAllModels" type="checkbox">显示非文本模型</label>
+        </div>
+        <datalist id="modelList"></datalist>
+        <label>主翻译模型
+          <input id="modelTranslate" list="modelList" type="text" autocomplete="off" placeholder="检测后选择，或手工输入模型 ID">
+        </label>
+        <label>回译方式
+          <select id="backTranslationMode">
+            <option value="same_request">同一次请求同时翻译和回译（默认）</option>
+            <option value="independent">第二次独立请求回译（更可靠，成本更高）</option>
+            <option value="off">关闭回译</option>
+          </select>
+        </label>
+        <p id="backTranslationModeHelp" class="settings-help">同请求模式只使用主翻译模型；模型先生成英文，再在同一响应中生成中文回译。</p>
+        <div id="independentBackSettings" class="conditional-settings hidden">
+          <label>独立回译模型
+            <input id="modelBackTranslate" list="modelList" type="text" autocomplete="off" placeholder="默认与主模型相同">
+          </label>
+          <label>独立回译等待（毫秒）
+            <input id="backTranslateDelayMs" type="number" min="300" max="5000" step="50">
+          </label>
+        </div>
+        <div class="button-row wrap">
+          <button id="testProviderButton" class="secondary-button" type="button">真实连通测试</button>
+          <span id="providerTestResult" class="inline-result" aria-live="polite"></span>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>翻译与同步</legend>
+        <div class="two-columns">
+          <label>停顿触发（毫秒）
+            <input id="debounceMs" type="number" min="200" max="2000" step="50">
+          </label>
+          <label>长文本阈值（字符）
+            <input id="longTextThreshold" type="number" min="500" max="10000" step="100">
+          </label>
+        </div>
+        <label>请求超时（毫秒）
+          <input id="requestTimeoutMs" type="number" min="5000" max="120000" step="1000">
+        </label>
+        <label class="inline-checkbox"><input id="allowFocusWrite" type="checkbox">无焦点策略失败时，允许短暂聚焦 Claude 输入框</label>
+        <label class="inline-checkbox"><input id="clearStaleTarget" type="checkbox">中文一修改，就尝试无焦点清除 Claude 中的旧译文</label>
+        <label>保护词（每行一个，原样保留）
+          <textarea id="protectedTerms" rows="4" spellcheck="false" placeholder="内部项目名&#10;产品名&#10;专有缩写"></textarea>
+        </label>
+      </fieldset>
+
+      <div class="danger-zone">
+        <button id="clearKeyButton" class="danger-button" type="button">清除所有已保存 Key</button>
+      </div>
+
+      <div class="modal-actions">
+        <button class="secondary-button close-dialog" type="button">取消</button>
+        <button id="saveSettingsButton" class="primary-button" type="submit">保存设置</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="historyDialog" class="modal compact-modal">
+    <div class="modal-header">
+      <div>
+        <h2>最近草稿</h2>
+        <p class="muted">仅保留在当前浏览器会话，最多 20 条。</p>
+      </div>
+      <button class="icon-button close-dialog" type="button" aria-label="关闭">×</button>
+    </div>
+    <div id="historyList" class="history-list"></div>
+  </dialog>
+
+  <dialog id="diagnosticsDialog" class="modal compact-modal">
+    <div class="modal-header">
+      <div>
+        <h2>Claude 页面诊断</h2>
+        <p class="muted">诊断不会自动发送任何消息。</p>
+      </div>
+      <button class="icon-button close-dialog" type="button" aria-label="关闭">×</button>
+    </div>
+    <dl id="diagnosticSummary" class="diagnostic-grid"></dl>
+    <div class="button-stack">
+      <button id="refreshDiagnosticButton" class="secondary-button" type="button">刷新输入框状态</button>
+      <button id="manualBindButton" class="secondary-button" type="button">手动绑定：随后点击 Claude 输入框</button>
+      <button id="diagnosticWriteButton" class="primary-button" type="button">写入诊断短句（不发送）</button>
+      <button id="diagnosticClearButton" class="secondary-button" type="button">清除插件拥有的诊断文字</button>
+    </div>
+    <div class="diagnostic-note">
+      <strong>发送链路 GO/NO-GO：</strong>
+      诊断短句成功写入后，请自行点击 Claude 的发送按钮，确认实际发出的全文与侧栏展示一致。插件不会读取 Claude 回复或已发送消息，因此这一步必须人工核对。
+    </div>
+    <ol id="diagnosticLog" class="diagnostic-log"></ol>
+  </dialog>
+
+  <script type="module" src="panel.js"></script>
+</body>
+</html>
