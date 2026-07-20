@@ -71,6 +71,7 @@ def build_test_bundle() -> str:
     # the panel from an about:blank document without network navigation.
     order = [
         "lib/shared.js",
+        "lib/reasoning.js",
         "lib/storage.js",
         "lib/provider.js",
         "lib/placeholders.js",

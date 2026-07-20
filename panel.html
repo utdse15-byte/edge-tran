@@ -137,6 +137,29 @@
             <option value="responses">Responses API（POST {baseUrl}/responses）</option>
           </select>
         </label>
+        <label>思考策略
+          <select id="reasoningMode">
+            <option value="inherit">继承接口默认（不发送思考字段）</option>
+            <option value="off">明确关闭思考</option>
+            <option value="manual">手动指定档位</option>
+          </select>
+        </label>
+        <div id="reasoningDetails" class="conditional-settings hidden">
+          <label>思考参数方言（由你的接口/反代决定）
+            <select id="reasoningDialect"></select>
+          </label>
+          <label>思考档位
+            <select id="reasoningEffort">
+              <option value="minimal">minimal</option>
+              <option value="low">low（推荐用于翻译）</option>
+              <option value="medium">medium</option>
+              <option value="high">high</option>
+              <option value="xhigh">xhigh</option>
+              <option value="max">max</option>
+            </select>
+          </label>
+        </div>
+        <p id="reasoningPreview" class="settings-help"></p>
         <div class="two-columns">
           <label>鉴权 Header
             <input id="authHeader" type="text" autocomplete="off" value="Authorization">

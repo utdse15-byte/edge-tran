@@ -322,6 +322,7 @@ def build_test_bundle() -> str:
     """Concatenate the production ES modules for an isolated about:blank test."""
     order = [
         "lib/shared.js",
+        "lib/reasoning.js",
         "lib/storage.js",
         "lib/provider.js",
         "lib/placeholders.js",

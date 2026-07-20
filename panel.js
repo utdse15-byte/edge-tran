@@ -33,6 +33,11 @@ import {
   secretRecordMetadata
 } from "./lib/storage.js";
 import {
+  applyReasoning,
+  normalizeReasoning,
+  reasoningDialectsForTransport
+} from "./lib/reasoning.js";
+import {
   buildHeaders,
   ensureProviderPermission,
   filterLikelyTextModels,
@@ -105,6 +110,11 @@ const ui = {
   providerName: $("#providerName"),
   baseUrl: $("#baseUrl"),
   apiProtocol: $("#apiProtocol"),
+  reasoningMode: $("#reasoningMode"),
+  reasoningDialect: $("#reasoningDialect"),
+  reasoningEffort: $("#reasoningEffort"),
+  reasoningDetails: $("#reasoningDetails"),
+  reasoningPreview: $("#reasoningPreview"),
   authHeader: $("#authHeader"),
   authPrefix: $("#authPrefix"),
   apiKey: $("#apiKey"),
@@ -352,7 +362,13 @@ function updateProviderSummary() {
   const protocolLabel = normalizedApiProtocol(state.provider) === "responses"
     ? " · Responses"
     : "";
-  ui.providerSummary.textContent = `${state.provider.name || "Provider"} · ${model} · ${modeLabel}${protocolLabel}`;
+  const reasoning = normalizeReasoning(state.provider.reasoning);
+  const reasoningLabel = reasoning.mode === "inherit"
+    ? ""
+    : reasoning.mode === "off"
+      ? " · 思考:关"
+      : ` · 思考:${reasoning.effort}`;
+  ui.providerSummary.textContent = `${state.provider.name || "Provider"} · ${model} · ${modeLabel}${protocolLabel}${reasoningLabel}`;
 }
 
 function updateTargetUI() {
@@ -765,10 +781,11 @@ function readTranslationCache(key) {
 
 function writeTranslationCache(key, result) {
   if (!key || !result) return;
-  // capabilityPatch/usage are request-time facts, not translation content;
-  // replaying a stale patch could resurrect a degradation the gateway no
-  // longer needs.
-  const entry = clone({ ...result, capabilityPatch: null, usage: null });
+  // capabilityPatch/usage/reasoningTokens are request-time facts, not
+  // translation content; replaying a stale patch could resurrect a
+  // degradation the gateway no longer needs, and a replay spends no
+  // reasoning tokens.
+  const entry = clone({ ...result, capabilityPatch: null, usage: null, reasoningTokens: null });
   state.translationCache.delete(key);
   state.translationCache.set(key, entry);
   while (state.translationCache.size > TRANSLATION_CACHE_LIMIT) {
@@ -1002,6 +1019,8 @@ function providerErrorMessage(error) {
       return "Provider 返回了 Chat Completions 结构；请在设置中把“接口协议”切换为 Chat Completions 后重试";
     case "unsupported_response_schema":
       return "Provider 响应结构与所选接口协议不符";
+    case "reasoning_rejected":
+      return "接口拒绝了当前思考参数；按严格策略未自动移除，请在设置中调整“思考策略/方言”或改回继承默认";
     case "empty_choices":
       return "Provider 返回了空 choices 数组";
     case "empty_assistant_content":
@@ -1810,6 +1829,9 @@ async function translateNow({ forceSync = false, forceOverwrite = false, reason 
     ) return;
 
     applyCapabilityPatch(result.capabilityPatch, providerContext);
+    if (Number.isFinite(result.reasoningTokens)) {
+      addDiagnostic(`本次翻译的推理用量：${result.reasoningTokens} reasoning tokens`);
+    }
     state.draft.english = result.english;
     state.draft.corrections = result.corrections;
     state.draft.ambiguities = result.ambiguities;
@@ -2574,6 +2596,56 @@ function finishFormRequest(request) {
   request.button.disabled = false;
 }
 
+const REASONING_DIALECT_LABELS = {
+  none: "不发送（未知反代的安全默认）",
+  openai_chat: "OpenAI Chat（顶层 reasoning_effort）",
+  openai_responses: "OpenAI Responses（reasoning.effort）",
+  openrouter: "OpenRouter（reasoning.effort）",
+  deepseek: "DeepSeek（thinking.type，档位映射 high/max）",
+  thinking_type: "通用 thinking.type（GLM 等）",
+  enable_thinking: "通用 enable_thinking（Qwen 等，仅开关）"
+};
+
+function populateReasoningDialects(selected) {
+  const transport = ui.apiProtocol.value === "responses" ? "responses" : "chat_completions";
+  const allowed = reasoningDialectsForTransport(transport);
+  clearElement(ui.reasoningDialect);
+  for (const dialect of allowed) {
+    const option = document.createElement("option");
+    option.value = dialect;
+    option.textContent = REASONING_DIALECT_LABELS[dialect] ?? dialect;
+    ui.reasoningDialect.append(option);
+  }
+  ui.reasoningDialect.value = allowed.includes(selected) ? selected : "none";
+}
+
+function updateReasoningControls() {
+  const mode = ui.reasoningMode.value;
+  const transport = ui.apiProtocol.value === "responses" ? "responses" : "chat_completions";
+  ui.reasoningDetails.classList.toggle("hidden", mode === "inherit");
+  ui.reasoningEffort.disabled = mode !== "manual";
+
+  if (mode === "inherit") {
+    ui.reasoningPreview.textContent = "不发送任何思考字段，完全继承接口默认行为。";
+    return;
+  }
+  const reasoning = {
+    dialect: ui.reasoningDialect.value,
+    mode,
+    effort: ui.reasoningEffort.value
+  };
+  if (reasoning.dialect === "none") {
+    ui.reasoningPreview.textContent = "尚未选择思考参数方言：当前不会发送任何思考字段。请按你的接口/反代文档选择方言。";
+    return;
+  }
+  const resolved = applyReasoning({}, transport, reasoning);
+  const parts = [];
+  if (resolved.emitted.length) parts.push(`将发送：${resolved.emitted.join("，")}`);
+  if (resolved.removed.length) parts.push(`将移除：${resolved.removed.join("，")}`);
+  parts.push(...resolved.notes);
+  ui.reasoningPreview.textContent = parts.join("；") || "本次不会发送思考字段。";
+}
+
 function fillSettingsForm() {
   ui.providerPreset.value = state.provider.preset || "custom";
   ui.providerName.value = state.provider.name || "";
@@ -2581,6 +2653,13 @@ function fillSettingsForm() {
   ui.apiProtocol.value = state.provider.apiProtocol === "responses"
     ? "responses"
     : "chat_completions";
+  {
+    const reasoning = normalizeReasoning(state.provider.reasoning);
+    ui.reasoningMode.value = reasoning.mode;
+    ui.reasoningEffort.value = reasoning.effort;
+    populateReasoningDialects(reasoning.dialect);
+    updateReasoningControls();
+  }
   ui.authHeader.value = state.provider.authHeader || "Authorization";
   ui.authPrefix.value = state.provider.authPrefix ?? "Bearer";
   ui.keyStorage.value = state.provider.keyStorage || "local";
@@ -2646,6 +2725,17 @@ function providerFromForm() {
   const apiProtocol = ui.apiProtocol.value === "responses"
     ? "responses"
     : "chat_completions";
+  const reasoning = normalizeReasoning({
+    dialect: ui.reasoningDialect.value,
+    mode: ui.reasoningMode.value,
+    effort: ui.reasoningEffort.value
+  });
+  if (reasoning.mode !== "inherit" && reasoning.dialect === "none") {
+    throw new Error("思考策略需要选择“思考参数方言”，或将策略改回“继承接口默认”");
+  }
+  if (!reasoningDialectsForTransport(apiProtocol).includes(reasoning.dialect)) {
+    throw new Error("所选思考参数方言与当前接口协议不匹配");
+  }
   const modelTranslate = ui.modelTranslate.value.trim();
   const modelBackTranslate = ui.modelBackTranslate.value.trim() || modelTranslate;
   const authHeader = ui.authHeader.value.trim() || "Authorization";
@@ -2679,6 +2769,7 @@ function providerFromForm() {
     name: ui.providerName.value.trim() || "Provider",
     baseUrl,
     apiProtocol,
+    reasoning,
     keyStorage: ui.keyStorage.value,
     authHeader,
     authPrefix,
@@ -2910,7 +3001,10 @@ async function testProviderFromForm() {
     const backPreview = backPreviewText
       ? ` / 回译：${backPreviewText.slice(0, 42)}`
       : "";
-    ui.providerTestResult.textContent = `通过 · ${Math.round(performance.now() - started)} ms · ${result.english.slice(0, 70)}${backPreview}`;
+    const reasoningNote = Number.isFinite(result.reasoningTokens)
+      ? ` · reasoning=${result.reasoningTokens}`
+      : "";
+    ui.providerTestResult.textContent = `通过 · ${Math.round(performance.now() - started)} ms${reasoningNote} · ${result.english.slice(0, 70)}${backPreview}`;
   } catch (error) {
     if (error?.name !== "AbortError" && formRequestIsCurrent(request)) {
       ui.providerTestResult.textContent = providerFormErrorMessage(error) || error.message;
@@ -3305,6 +3399,13 @@ function bindEvents() {
     state.formCapabilitySignature = null;
     state.formCapabilities = null;
   });
+  ui.apiProtocol.addEventListener("change", () => {
+    populateReasoningDialects(ui.reasoningDialect.value);
+    updateReasoningControls();
+  });
+  ui.reasoningMode.addEventListener("change", updateReasoningControls);
+  ui.reasoningDialect.addEventListener("change", updateReasoningControls);
+  ui.reasoningEffort.addEventListener("change", updateReasoningControls);
   ui.backTranslationMode.addEventListener("change", () => {
     updateBackSettingsVisibility();
     if (
