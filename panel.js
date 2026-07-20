@@ -1345,7 +1345,10 @@ function handlePanelMessage(message) {
         state.targetPhase = state.target.pluginOwned
           ? (englishCurrent ? "synced" : (state.target.currentText ? "stale-uncleared" : "empty"))
           : "empty";
-        setStatus(state.target.composerReady ? "Claude 输入框已绑定" : "已绑定，但尚未找到输入框", "idle");
+        // BIND_RESULT may carry a pre-attach state snapshot; the writer's
+        // post-attach WRITER_STATE follows within moments and corrects it, so
+        // an unlocated composer here is "still locating", not a verdict.
+        setStatus(state.target.composerReady ? "Claude 输入框已绑定" : "已绑定，正在定位输入框…", "idle");
       }
       updateTargetUI();
       updateDraftUI();

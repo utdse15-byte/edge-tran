@@ -1,6 +1,6 @@
 # Build Report
 
-- Version: **0.2.12**
+- Version: **0.2.13**
 - Date: 2026-07-20
 - Baseline: `npm run verify:full` 全部通过
   - Node 测试（`node --test tests/*.test.js`）
@@ -18,6 +18,7 @@
 - 0.2.10：体验收敛——主按钮如实文案、三态自动化（含旧配置迁移）、单向 Esc、人工修改保护默认、双上限计数器、回译请求次数标注、:focus-visible 可达性。
 - 0.2.11：摩擦清除与可诊断化——系统性暂停自愈（pauseKind 四分类）、外部配置采纳并继续、评审门默认非拦截（可选严格评审）、HTTP 错误网关证据（脱敏正文摘录/request-id/协议+流式标记）、连通测试传输镜像与失败自动定位（缓冲/协议对照）。
 - 0.2.12：零删除与定位稳定——移除旧译文自动清理（含中途换稿闪空）、已有内容安静保护态、CLEAR_TARGET_FORCE 显式清空按钮（附件仍受保护）、居中主输入框形状识别修复切页定位、visibilitychange/focus/状态询问重扫触发。
+- 0.2.13：外部定位分析核验修复——导航后发现优先（旧节点不再粘滞）、深可见性检查（祖先 opacity/inert/aria-hidden）、不可用≠被清空语义（composer_unavailable，所有权保留与重认领）、会话内联编辑器硬排除、BIND_RESULT 竞态文案缓解。
 
 ## 注意
 

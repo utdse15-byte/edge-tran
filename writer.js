@@ -71,19 +71,41 @@
       .trimEnd();
   }
 
-  function isVisible(element, minWidth = 1, minHeight = 1) {
+  function isVisible(element, minWidth = 1, minHeight = 1, { deep = false } = {}) {
     if (!(element instanceof HTMLElement)) return false;
     const style = getComputedStyle(element);
     if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
     const rect = element.getBoundingClientRect();
-    return (
+    if (!(
       rect.width >= minWidth
       && rect.height >= minHeight
       && rect.bottom > 0
       && rect.top < innerHeight
       && rect.right > 0
       && rect.left < innerWidth
-    );
+    )) return false;
+    if (!deep) return true;
+    // Ancestor walk for candidate editors only (buttons keep the cheap self
+    // check). display:none zeroes the rect and visibility inherits, but a
+    // stale route cached behind an ancestor opacity:0 / inert / aria-hidden
+    // keeps the descendant's own computed style pristine — exactly the hole
+    // that let a previous page's composer stay "writable".
+    for (let node = element; node instanceof HTMLElement; node = node.parentElement) {
+      if (
+        node.hidden
+        || node.inert === true
+        || node.getAttribute("aria-hidden") === "true"
+      ) return false;
+      const nodeStyle = node === element ? style : getComputedStyle(node);
+      if (
+        nodeStyle.display === "none"
+        || nodeStyle.visibility === "hidden"
+        || nodeStyle.visibility === "collapse"
+        || Number(nodeStyle.opacity) < 0.01
+        || nodeStyle.contentVisibility === "hidden"
+      ) return false;
+    }
+    return true;
   }
 
   function isTextControl(element) {
@@ -94,7 +116,7 @@
   }
 
   function isEditableCandidate(element) {
-    if (!(element instanceof HTMLElement) || !isVisible(element, 48, 12)) {
+    if (!(element instanceof HTMLElement) || !isVisible(element, 48, 12, { deep: true })) {
       return false;
     }
     if (isTextControl(element)) return !element.disabled && !element.readOnly;
@@ -207,6 +229,14 @@
   }
 
   function candidateScore(element) {
+    // Hard exclusion, not a penalty: an inline history-message editor carries
+    // the same editor semantics, message hints and a nearby send control as
+    // the real composer, so a score deduction could still let it win. Writing
+    // a translation into someone's past message is never acceptable — manual
+    // bind remains the deliberate escape hatch.
+    if (element.closest('article, [data-testid*="conversation-turn" i]')) {
+      return Number.NEGATIVE_INFINITY;
+    }
     const rect = element.getBoundingClientRect();
     const hint = messageHintFor(element);
     const hasMessageHint = /(message|prompt|chat|claude|compose|write|ask|消息|输入|提问)/i.test(hint);
@@ -769,6 +799,22 @@
     }
 
     if (!composer) {
+      // "Unavailable" is not "cleared": when the previous node is still
+      // connected and demonstrably still holds its text (hidden ancestor,
+      // route transition, grace-period expiry), nothing was cleared and
+      // nothing was sent. Report not-ready, keep the ownership bookkeeping
+      // and any live send intent for the moment the text is actually
+      // observed to change. Fabricating TARGET_CLEARED here made the panel
+      // announce "输入框被外部清空" while the text sat untouched on screen.
+      const previousStillHoldsText = Boolean(
+        previousComposer
+        && previousComposer.isConnected
+        && readComposerText(previousComposer) === previousText
+      );
+      if (previousStillHoldsText) {
+        sendState("composer_unavailable");
+        return;
+      }
       lastObservedText = "";
       pluginOwned = false;
       if (previousText) confirmClear(previousText, replacementSendIntent);
@@ -847,12 +893,22 @@
       resetForNavigation({ preserveSendIntent: Boolean(navigationSendIntent) });
       // SPA navigation frequently replaces the editor node. A replacement and
       // the URL transition are one logical event: let bindComposer reconcile
-      // the old text exactly once. The old implementation confirmed the clear
-      // here and then confirmed it again while rebinding, producing a false
-      // TARGET_CLEARED immediately after SEND_CONFIRMED.
-      const nextComposer = composer?.isConnected && isEditableCandidate(composer)
-        ? composer
-        : locateComposer();
+      // the old text exactly once.
+      //
+      // Discovery runs FIRST: the previous node may belong to the page that
+      // was just left (routes can keep it connected — hidden, animating out,
+      // or cached — for a while). Preferring it merely because it was still
+      // connected made the stale node the "current" target, and the
+      // steady-state re-rank hysteresis (score +60, text-equality) then
+      // blocked the switch to the new page's identical-looking composer
+      // indefinitely. If the SPA genuinely reused the same editor, discovery
+      // returns that very node and the same-composer branch reconciles it.
+      // The old node is kept only as a fallback when discovery finds nothing
+      // AND it still passes the deep visibility check — an ancestor-hidden
+      // route cache fails that check and correctly yields "no composer".
+      const located = locateComposer();
+      const nextComposer = located
+        ?? (composer?.isConnected && isEditableCandidate(composer) ? composer : null);
       if (nextComposer !== composer) {
         bindComposer(nextComposer, "navigation_rebound", {
           previousText: previousObservedText,
