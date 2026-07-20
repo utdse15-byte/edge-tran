@@ -313,6 +313,16 @@
     return normalizeText(serializeContentContainer(element));
   }
 
+  // Un-normalized serialization. normalizeText() erases trailing newlines and
+  // blank blocks, which makes an end-of-document edit (the typical effect of
+  // a plain Enter inside a trailing code block or list) invisible to the
+  // normalized readback. The send-intent bookkeeping needs to see it.
+  function rawComposerSerialization(element = composer) {
+    if (!element) return "";
+    if (isTextControl(element)) return String(element.value ?? "");
+    return serializeContentContainer(element);
+  }
+
   function protectedComposerNode(element = composer) {
     if (!element || isTextControl(element)) return null;
     const alwaysAtomic = element.querySelector(
@@ -397,6 +407,11 @@
     sendIntent = {
       kind,
       text,
+      // Raw (un-trimmed) serialization at intent time. ProseMirror handles
+      // Enter in its keydown keymap and suppresses the native input events,
+      // so a trailing-only insertion can only be detected by comparing this
+      // against the raw serialization during reconcile.
+      rawText: rawComposerSerialization(),
       timestamp: Date.now(),
       writerSession,
       targetEpoch
@@ -477,7 +492,20 @@
 
     const current = readComposerText();
     const previous = lastObservedText;
-    if (current === previous) return;
+    if (current === previous) {
+      // A plain Enter that only edited the end of the document (newline in a
+      // trailing code block, new list item) changes the raw serialization but
+      // not the normalized text, and ProseMirror suppresses the input events
+      // the cancellation paths in handleComposerInput rely on. Such an Enter
+      // was editing, not sending: cancel the keyboard intent so a clear or
+      // conversation switch within the TTL is not archived as a false send.
+      if (
+        sendIntent?.kind === "keyboard"
+        && typeof sendIntent.rawText === "string"
+        && rawComposerSerialization() !== sendIntent.rawText
+      ) clearSendIntent();
+      return;
+    }
     lastObservedText = current;
 
     if (performance.now() < suppressUntil && current === normalizeText(expectedWriteText)) return;
@@ -678,9 +706,15 @@
     // URL; validating only after the rebind would incorrectly invalidate the
     // trusted intent and leave the side-panel draft unarchived. A navigation
     // caller may provide the intent captured before writerSession changed.
+    // Capture the intent even when no replacement composer is locatable yet
+    // (nextComposer null): after a real send Claude may unmount the editor
+    // before its replacement exists, and the epoch bump below would otherwise
+    // invalidate a trusted in-TTL intent, turning the send into a false
+    // TARGET_CLEARED that never archives the draft. confirmClear still
+    // validates the text match before treating it as a send.
     const replacementSendIntent = Object.hasOwn(options, "sendIntent")
       ? options.sendIntent
-      : previousComposer && nextComposer && validSendIntent()
+      : previousComposer && validSendIntent()
         && normalizeText(sendIntent?.text) === normalizeText(previousText)
         ? { ...sendIntent }
         : null;
@@ -707,11 +741,27 @@
     lastObservedText = current;
 
     if (!current && previousText) {
-      // A composer replacement that drops non-empty text is observable even
-      // without a URL change. Treat it as a confirmed send only when the
-      // trusted intent captured above matches; otherwise report an external
-      // clear so the Chinese source is preserved and automatic sync pauses.
-      confirmClear(previousText, replacementSendIntent);
+      const previousStillHoldsText = Boolean(
+        previousComposer
+        && previousComposer.isConnected
+        && readComposerText(previousComposer) === previousText
+      );
+      if (previousStillHoldsText && !replacementSendIntent) {
+        // Switching to a different (empty) editor — e.g. a manual bind away
+        // from a wrongly auto-bound node — while the old editor still holds
+        // its text untouched. Nothing was cleared and nothing was sent, so
+        // only downgrade ownership; fabricating a TARGET_CLEARED here would
+        // pause the panel with a false "externally cleared" banner.
+        lastWritten = "";
+        pluginOwned = false;
+        clearSendIntent();
+      } else {
+        // A composer replacement that drops non-empty text is observable even
+        // without a URL change. Treat it as a confirmed send only when the
+        // trusted intent captured above matches; otherwise report an external
+        // clear so the Chinese source is preserved and automatic sync pauses.
+        confirmClear(previousText, replacementSendIntent);
+      }
     } else if (previouslyOwned && current === previousLastWritten) {
       lastWritten = previousLastWritten;
       pluginOwned = true;
@@ -888,6 +938,23 @@
       return;
     }
     detach("reattach");
+    // While detached nothing observes SPA navigation, so lastUrl may be stale
+    // here. Adopt the current URL and rotate per-conversation state now,
+    // silently: this attach establishes fresh state that the panel adopts
+    // wholesale from BIND_RESULT and the attached WRITER_STATE, so the
+    // WRITER_SESSION_CHANGED pause used for live navigations is not needed.
+    // Without this, the first stateful command after binding would hit the
+    // URL check in validateExpectedState, rotate the session then, and fail
+    // with writer_session_changed plus a forced pause.
+    if (location.href !== lastUrl) {
+      lastUrl = location.href;
+      writerSession = randomId("writer");
+      targetEpoch += 1;
+      lastWritten = "";
+      pluginOwned = false;
+      preferredStrategy = null;
+      clearSendIntent();
+    }
     lifecycleGeneration += 1;
     attached = true;
     lease = attachLease;

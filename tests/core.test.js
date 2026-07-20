@@ -1755,3 +1755,61 @@ test("provider credential binding orders headers by code units, not locale", () 
   // interleave them and could change across browser/locale updates.
   assert.deepEqual(parsed.extraHeaders.map(([name]) => name), ["x-a", "x-b", "x_a"]);
 });
+
+test("rejects typo claims that alter Chinese numerals or ordinals", () => {
+  // Chinese numerals are plain Han codepoints: without a dedicated class they
+  // pass the short-Han shape check, and the ASCII-only number warning never
+  // fires either — a claimed slip could silently change a quantity.
+  for (const [source, original, interpreted_as] of [
+    ["把超时设成三十秒", "三十", "五十"],
+    ["取第三个结果", "第三", "第五"],
+    ["加两个节点", "两个", "三个"],
+    ["预留一半容量", "一半", "大半"]
+  ]) {
+    const result = validateTranslationPayload({
+      english: "test",
+      corrections: [{ original, interpreted_as, reason: "model claim" }],
+      ambiguous: []
+    }, source);
+    assert.ok(
+      result.errors.some((item) => item.includes("笔误")),
+      `${original}→${interpreted_as} should be rejected`
+    );
+    assert.equal(result.corrections.length, 0);
+  }
+
+  // A numeral-free obvious typo stays accepted.
+  const accepted = validateTranslationPayload({
+    english: "Please help me review the code.",
+    corrections: [{ original: "帮嘛", interpreted_as: "帮忙", reason: "错字" }],
+    ambiguous: []
+  }, "请帮嘛检查代码");
+  assert.deepEqual(accepted.errors, []);
+  assert.equal(accepted.corrections.length, 1);
+});
+
+test("flags answer-style phrasing including the Sure opener", () => {
+  // The old pattern put a \b after "sure[,!]"; a boundary after punctuation
+  // requires a following word character, so "Sure, ..." never matched.
+  assert.ok(buildSoftWarnings("检查代码", "Sure, I can review the code.")
+    .some((item) => item.includes("回答式")));
+  assert.ok(buildSoftWarnings("检查代码", "Sure! Here is what I found.")
+    .some((item) => item.includes("回答式")));
+  assert.ok(buildSoftWarnings("检查代码", "Here's the review of the code.")
+    .some((item) => item.includes("回答式")));
+  // "ensure," and a plain translated "sure" must not false-positive.
+  assert.equal(
+    buildSoftWarnings("确保设置生效", "Make sure the setting takes effect. To ensure, check twice.")
+      .some((item) => item.includes("回答式")),
+    false
+  );
+});
+
+test("rejects claude.ai as provider host in trailing-dot FQDN form", () => {
+  // "claude.ai." (root-label dot) resolves to the same host but bypassed the
+  // exact-string ban, aiming provider requests at the Claude site.
+  assert.throws(() => normalizeBaseUrl("https://claude.ai./v1"), /Claude 站点/);
+  assert.throws(() => normalizeBaseUrl("https://api.claude.ai./v1"), /Claude 站点/);
+  // A trailing dot on an unrelated provider host stays allowed.
+  assert.equal(normalizeBaseUrl("https://api.openai.com./v1"), "https://api.openai.com./v1");
+});
