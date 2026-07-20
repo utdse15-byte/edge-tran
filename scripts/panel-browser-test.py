@@ -495,8 +495,10 @@ def main() -> None:
         assert "仍有内容" in page.locator("#statusBar").inner_text()
 
         # A save from another Edge window receives a new credential generation.
-        # The current panel must invalidate in-flight work and pause rather than
-        # combining that external key with a cached Provider snapshot.
+        # The current panel must invalidate in-flight work and adopt the new
+        # configuration rather than combining that external key with a cached
+        # Provider snapshot. (The panel is still review-paused here from the
+        # manual banner above; adoption must not silently lift that pause.)
         current_provider = page.evaluate("window.__mock.local.get('zh2en.provider.v1')")
         current_secret = page.evaluate("window.__mock.local.get('zh2en.secret.local.v1')")
         external_provider = {
@@ -535,9 +537,9 @@ def main() -> None:
         assert errors == [], errors
 
         # A second isolated panel simulates another Edge window changing the
-        # Provider and credential generation. The active panel must stop, load
-        # the new configuration, and never expose the new key to its stale
-        # Provider snapshot.
+        # Provider and credential generation. The active panel must adopt the
+        # new configuration WITHOUT forcing a manual 恢复 (v0.2.11), and never
+        # expose the new key to its stale Provider snapshot.
         cross_page = browser.new_page(viewport={"width": 430, "height": 900})
         cross_errors: list[str] = []
         cross_page.on("pageerror", lambda error: cross_errors.append(str(error)))
@@ -574,7 +576,9 @@ def main() -> None:
             "document.querySelector('#statusBar').textContent.includes('另一个窗口')",
             timeout=10000,
         )
-        assert cross_page.locator("#pauseButton").inner_text() == "恢复"
+        # v0.2.11: external configuration is adopted and automation continues —
+        # no forced manual 恢复 for a change the user made themselves.
+        assert cross_page.locator("#pauseButton").inner_text() == "暂停"
         assert "External Provider" in cross_page.locator("#providerSummary").inner_text()
         assert cross_page.evaluate("getSecretForProvider(window.__mock.staleProvider)") == ""
         assert cross_page.evaluate(
@@ -692,6 +696,44 @@ def main() -> None:
         )
         assert stability_page.evaluate("window.__mock.translationCalls") == calls_before + 1, \
             "returning to a cached draft must replay without a Provider request"
+
+        # v0.2.11 pause overhaul: (4) a system pause (external clear) self-heals
+        # when the user keeps typing — no 恢复 click required.
+        stability_page.evaluate("""
+          window.__mock.writer.text = '';
+          window.__mock.writer.pluginOwned = false;
+          window.__mock.writer.epoch += 1;
+          window.__mock.emit({
+            type: 'TARGET_CLEARED', tabId: window.__mock.writer.tabId,
+            writerSession: window.__mock.writer.session,
+            targetEpoch: window.__mock.writer.epoch
+          });
+        """)
+        stability_page.wait_for_function(
+            "document.querySelector('#pauseButton').textContent === '恢复'", timeout=10000
+        )
+        stability_page.locator("#sourceText").fill("第三版。")
+        stability_page.wait_for_function(
+            "document.querySelector('#pauseButton').textContent === '暂停'", timeout=10000
+        )
+        stability_page.wait_for_function(
+            "document.querySelector('#englishText').value === 'Third version.'", timeout=10000
+        )
+        stability_page.wait_for_function(
+            "window.__mock.writer.text === 'Third version.'", timeout=10000
+        )
+
+        # (5) An explicit Esc pause is a user decision: typing must NOT lift it
+        # and no auto-translation may fire while it holds.
+        stability_page.locator("#sourceText").press("Escape")
+        assert stability_page.locator("#pauseButton").inner_text() == "恢复"
+        calls_esc = stability_page.evaluate("window.__mock.translationCalls")
+        stability_page.locator("#sourceText").fill("第四版。")
+        stability_page.wait_for_timeout(700)
+        assert stability_page.locator("#pauseButton").inner_text() == "恢复", \
+            "typing must not lift a user (Esc) pause"
+        assert stability_page.evaluate("window.__mock.translationCalls") == calls_esc, \
+            "no auto-translation while user-paused"
 
         assert stability_errors == [], stability_errors
         stability_page.close()
