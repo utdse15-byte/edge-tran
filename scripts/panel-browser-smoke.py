@@ -130,7 +130,7 @@ with sync_playwright() as playwright:
 
     page.locator("#sourceText").fill("你好，保留 👨‍👩‍👧‍👦")
     page.wait_for_timeout(250)
-    assert page.locator("#sourceCount").inner_text() == "13"
+    assert page.locator("#sourceCount").inner_text() == "13 / 50,000"
     assert page.locator("#statusBar").inner_text() == "等待翻译…"
     assert page_errors == [], page_errors
 

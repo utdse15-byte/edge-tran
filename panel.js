@@ -80,7 +80,7 @@ const ui = {
   baselineButton: $("#baselineButton"),
   sourceText: $("#sourceText"),
   sourceCount: $("#sourceCount"),
-  autoSyncToggle: $("#autoSyncToggle"),
+  automationMode: $("#automationMode"),
   translateButton: $("#translateButton"),
   pauseButton: $("#pauseButton"),
   clearDraftButton: $("#clearDraftButton"),
@@ -424,16 +424,18 @@ function updateDraftUI({ preserveSourceSelection = true } = {}) {
   // source string three times, which became noticeably wasteful for long
   // pasted drafts even though automatic translation was already disabled.
   const sourceLength = codePointLength(state.draft.source);
-  ui.sourceCount.textContent = `${sourceLength}`;
-  ui.autoSyncToggle.checked = Boolean(state.settings.autoSync);
+  ui.sourceCount.textContent = sourceLength > MAX_SOURCE_CODEPOINTS
+    ? `${sourceLength} / 50,000（超出，需拆分）`
+    : `${sourceLength} / 50,000`;
+  ui.automationMode.value = state.settings.automationMode ?? "auto_sync";
   ui.pauseButton.textContent = state.paused ? "恢复" : "暂停";
   ui.longTextHint.classList.toggle(
     "hidden",
     sourceLength <= state.settings.longTextThreshold
   );
   ui.translateButton.textContent = sourceLength > state.settings.longTextThreshold
-    ? "翻译整段"
-    : "立即翻译";
+    ? "翻译整段并同步"
+    : "翻译并同步";
 
   if (!state.draft.english) setBadge(ui.syncBadge, "未生成");
   else if (state.targetPhase === "synced") setBadge(ui.syncBadge, "已同步", "success");
@@ -946,7 +948,7 @@ function scheduleExternalConfigurationReload(reasons) {
       state.externalConfigurationChanged = true;
       state.formCapabilitySignature = null;
       state.formCapabilities = null;
-      ui.autoSyncToggle.checked = Boolean(state.settings.autoSync);
+      ui.automationMode.value = state.settings.automationMode ?? "auto_sync";
       updateProviderSummary();
       updateBackOutputPresentation();
       updateDraftUI();
@@ -1658,7 +1660,7 @@ function scheduleStaleTargetClear({ force = false } = {}) {
 }
 
 function scheduleTranslation() {
-  if (state.paused || state.composing || !state.settings.autoSync) return;
+  if (state.paused || state.composing || state.settings.automationMode === "manual") return;
   const length = codePointLength(state.draft.source, state.settings.longTextThreshold);
   if (!state.draft.source.trim() || length > state.settings.longTextThreshold) return;
   if (state.cooldownUntil > Date.now()) return;
@@ -1675,7 +1677,10 @@ function scheduleTranslation() {
   const delay = sentenceEnding ? state.settings.sentenceEndDelayMs : state.settings.debounceMs;
   state.debounceTimer = setTimeout(() => {
     state.debounceTimer = null;
-    void translateNow({ forceSync: true, reason: "debounce" });
+    void translateNow({
+      forceSync: state.settings.automationMode === "auto_sync",
+      reason: "debounce"
+    });
   }, delay);
   setStatus("等待翻译…", "waiting");
 }
@@ -1882,7 +1887,7 @@ async function translateNow({ forceSync = false, forceOverwrite = false, reason 
       return;
     }
 
-    const shouldSync = forceSync || providerContext.settings.autoSync;
+    const shouldSync = forceSync || providerContext.settings.automationMode === "auto_sync";
     if (shouldSync) {
       await syncEnglish({
         forceOverwrite,
@@ -2787,7 +2792,10 @@ function providerFromForm() {
 function settingsFromForm() {
   return {
     ...state.settings,
-    autoSync: ui.autoSyncToggle.checked,
+    automationMode: ui.automationMode.value === "manual" || ui.automationMode.value === "auto_translate"
+      ? ui.automationMode.value
+      : "auto_sync",
+    autoSync: ui.automationMode.value !== "manual",
     backTranslationMode: normalizeBackTranslationMode(ui.backTranslationMode.value),
     debounceMs: clampInteger(ui.debounceMs.value, 200, 2000, DEFAULT_SETTINGS.debounceMs),
     longTextThreshold: clampInteger(ui.longTextThreshold.value, 500, 10000, DEFAULT_SETTINGS.longTextThreshold),
@@ -3324,11 +3332,17 @@ function bindEvents() {
       void translateNow({ forceSync: true, forceOverwrite: false, reason: "shortcut" });
     } else if (event.key === "Escape") {
       event.preventDefault();
-      state.paused = !state.paused;
+      // One-way by design: a panic keypress may only reduce automation. A
+      // second Esc must never re-arm auto translate/sync — resuming requires
+      // the explicit 恢复 button.
+      if (state.paused) {
+        setStatus("已处于暂停状态；恢复请点击“恢复”按钮", "paused");
+        return;
+      }
+      state.paused = true;
       state.pausedByTargetLoss = false;
-      if (state.paused) abortInFlight();
-      else scheduleTranslation();
-      setStatus(state.paused ? "自动翻译与同步已暂停" : "自动翻译与同步已恢复", state.paused ? "paused" : "idle");
+      abortInFlight();
+      setStatus("自动翻译与同步已暂停（Esc 仅暂停，恢复请点按钮）", "paused");
       updateDraftUI();
     }
   });
@@ -3346,12 +3360,23 @@ function bindEvents() {
   ui.clearDraftButton.addEventListener("click", () => {
     observeBackgroundTask(clearCurrentDraft(), "清空草稿");
   });
-  ui.autoSyncToggle.addEventListener("change", () => {
-    state.settings.autoSync = ui.autoSyncToggle.checked;
+  ui.automationMode.addEventListener("change", () => {
+    const mode = ["manual", "auto_translate", "auto_sync"].includes(ui.automationMode.value)
+      ? ui.automationMode.value
+      : "auto_sync";
+    state.settings.automationMode = mode;
+    state.settings.autoSync = mode !== "manual";
     observeBackgroundTask(persistSettings(state.settings), "设置");
-    if (state.settings.autoSync) scheduleTranslation();
-    else abortInFlight();
-    setStatus(state.settings.autoSync ? "自动翻译已开启" : "自动翻译已关闭，可手动触发", "idle");
+    if (mode === "manual") abortInFlight();
+    else scheduleTranslation();
+    setStatus(
+      mode === "manual"
+        ? "手动模式：不自动请求模型，点“翻译并同步”触发"
+        : mode === "auto_translate"
+          ? "自动翻译：停顿后请求模型，但不写入 Claude；点“同步到 Claude”写入"
+          : "自动翻译并同步：停顿后请求模型并写入 Claude 输入框",
+      "idle"
+    );
   });
   ui.syncButton.addEventListener("click", async () => {
     const force = state.targetPhase === "manual" || (state.target.currentText && !state.target.pluginOwned);
@@ -3362,6 +3387,7 @@ function bindEvents() {
 
   ui.keepManualButton.addEventListener("click", () => void keepManualVersion());
   ui.regenerateButton.addEventListener("click", () => {
+    if (!confirm("将用最新中文重新翻译，并覆盖你在 Claude 输入框中的人工修改。是否继续？")) return;
     state.paused = false;
     hideManualBanner();
     void translateNow({ forceSync: true, forceOverwrite: true, reason: "manual_reclaim" });
