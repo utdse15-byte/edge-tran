@@ -125,5 +125,88 @@ with sync_playwright() as p:
   page.wait_for_timeout(320)
   cancelled=page.evaluate('window.__h.messages.findLast(m=>m.type==="START_MANUAL_BIND_RESULT" && m.requestId==="manual-cancel")')
   assert cancelled and not cancelled['ok'] and cancelled['code']=='manual_bind_cancelled', (cancelled, page.evaluate('window.__h.messages'))
+  page.close()
+
+  # A real send may unmount the composer before any replacement is locatable.
+  # The trusted in-TTL Enter intent must still confirm the send instead of
+  # degrading into a false TARGET_CLEARED that never archives the draft.
+  page=b.new_page(viewport={'width':1200,'height':800}); hello=setup(page,'ce'); ws=hello['writerSession']
+  r=send(page, {'type':'WRITE_TARGET','requestId':'rm-w','lease':'L','text':'will send','expectedWriterSession':ws,'expectedTargetEpoch':0,'allowFocus':True})
+  assert r['ok'], r
+  page.locator('#editor').evaluate('''(e) => e.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    setTimeout(() => e.remove(), 30);
+  })''')
+  page.locator('#editor').click(); page.keyboard.press('Enter')
+  page.wait_for_timeout(400)
+  sent=page.evaluate('window.__h.messages.findLast(m=>m.type==="SEND_CONFIRMED")')
+  assert sent and sent['sentText']=='will send', (sent, page.evaluate('window.__h.messages'))
+  page.close()
+
+  # A plain Enter that only appends a trailing blank block (ProseMirror-style:
+  # Enter handled in keydown, native input events suppressed, normalized text
+  # unchanged) is editing, not sending. A page-side clear afterwards must be
+  # reported as TARGET_CLEARED, never archived as a confirmed send.
+  page=b.new_page(viewport={'width':1200,'height':800}); hello=setup(page,'ce'); ws=hello['writerSession']
+  r=send(page, {'type':'WRITE_TARGET','requestId':'tr-w','lease':'L','text':'kept text','expectedWriterSession':ws,'expectedTargetEpoch':0,'allowFocus':True})
+  assert r['ok'], r
+  page.locator('#editor').evaluate('''(e) => e.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    const paragraph = document.createElement('p');
+    paragraph.appendChild(document.createElement('br'));
+    e.appendChild(paragraph);
+  })''')
+  page.locator('#editor').click(); page.keyboard.press('Enter')
+  page.wait_for_timeout(150)
+  page.locator('#editor').evaluate('(e)=>e.replaceChildren()')
+  page.wait_for_timeout(150)
+  cleared=page.evaluate('window.__h.messages.findLast(m=>m.type==="TARGET_CLEARED")')
+  false_send=page.evaluate('window.__h.messages.findLast(m=>m.type==="SEND_CONFIRMED")')
+  assert cleared and cleared['previousText']=='kept text', (cleared, page.evaluate('window.__h.messages'))
+  assert not false_send, false_send
+  page.close()
+
+  # While detached nothing observes SPA navigation, so a later attach must
+  # adopt the URL up front with a silent session rotation: the panel adopts
+  # the fresh state wholesale, and the first write must succeed instead of
+  # failing writer_session_changed with a forced pause.
+  page=b.new_page(viewport={'width':1200,'height':800}); hello=setup(page,'ce'); ws=hello['writerSession']
+  page.evaluate('(m)=>window.__h.msgListeners[0](m)', {'type':'DETACH','lease':'L','reason':'smoke_nav_detach'})
+  page.evaluate('history.pushState({}, "", "#other-conversation")')
+  page.wait_for_timeout(30)
+  page.evaluate('(m)=>window.__h.msgListeners[0](m)', {'type':'ATTACH','lease':'L2'})
+  page.wait_for_timeout(80)
+  attached_state=page.evaluate('window.__h.messages.findLast(m=>m.type==="WRITER_STATE" && m.reason==="attached")')
+  assert attached_state and attached_state['writerSession']!=ws, (attached_state, ws)
+  assert not page.evaluate('window.__h.messages.some(m=>m.type==="WRITER_SESSION_CHANGED")'), page.evaluate('window.__h.messages')
+  r=send(page, {'type':'WRITE_TARGET','requestId':'nav-w','lease':'L2','text':'post nav','expectedWriterSession':attached_state['writerSession'],'expectedTargetEpoch':attached_state['state']['targetEpoch'],'allowFocus':True})
+  assert r['ok'] and page.locator('#editor').inner_text()=='post nav', r
+  page.close()
+
+  # Manually binding to a different, empty editor while the previous editor
+  # still holds its text untouched clears nothing and sends nothing: it must
+  # not fabricate a TARGET_CLEARED "externally cleared" pause.
+  page=b.new_page(viewport={'width':1200,'height':800})
+  page.set_content('''<!doctype html><body><div style="height:500px"></div>
+    <form onsubmit="return false">
+      <div id="editor" contenteditable="true" role="textbox" aria-label="Message Claude" style="width:700px;height:120px;border:1px solid"></div>
+      <button id="send" type="button" aria-label="Send message">Send</button>
+    </form>
+    <div id="second" contenteditable="true" style="width:500px;height:80px;border:1px solid"></div>
+  </body>''')
+  page.evaluate('''() => {const messages=[];const msgListeners=[];const disconnect=[];const port={postMessage(m){messages.push(structuredClone(m));},onMessage:{addListener(fn){msgListeners.push(fn)}},onDisconnect:{addListener(fn){disconnect.push(fn)}},disconnect(){for(const fn of disconnect)fn();}};window.__h={messages,msgListeners,disconnect};window.chrome={runtime:{id:'test',connect(){return port}}};}''')
+  page.add_script_tag(content=js); page.wait_for_timeout(30)
+  hello=page.evaluate('window.__h.messages.find(m=>m.type==="WRITER_HELLO")'); ws=hello['writerSession']
+  page.evaluate('(m)=>window.__h.msgListeners[0](m)', {'type':'ATTACH','lease':'L'}); page.wait_for_timeout(60)
+  r=send(page, {'type':'WRITE_TARGET','requestId':'mb-w','lease':'L','text':'still here','expectedWriterSession':ws,'expectedTargetEpoch':0,'allowFocus':True})
+  assert r['ok'], r
+  page.evaluate('(m)=>window.__h.msgListeners[0](m)', {'type':'START_MANUAL_BIND','requestId':'manual-switch','lease':'L'})
+  page.wait_for_timeout(20); page.locator('#second').click(); page.wait_for_timeout(320)
+  manual_switch=page.evaluate('window.__h.messages.findLast(m=>m.type==="START_MANUAL_BIND_RESULT" && m.requestId==="manual-switch")')
+  assert manual_switch and manual_switch['ok'] and manual_switch['state']['composerReady'], (manual_switch, page.evaluate('window.__h.messages'))
+  assert not page.evaluate('window.__h.messages.some(m=>m.type==="TARGET_CLEARED")'), page.evaluate('window.__h.messages')
+  assert page.locator('#editor').inner_text()=='still here'
   page.close(); b.close()
 print('Writer browser smoke: PASS')

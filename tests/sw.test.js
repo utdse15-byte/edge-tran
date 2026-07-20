@@ -495,3 +495,114 @@ test("service worker rejects prerendered writers and follows a tab moved between
     globalThis.chrome = originalChrome;
   }
 });
+
+test("service worker releases the old lease when a rebind attempt fails", async () => {
+  const originalChrome = globalThis.chrome;
+  const runtime = {
+    onInstalled: new FakeEvent(),
+    onStartup: new FakeEvent(),
+    onConnect: new FakeEvent()
+  };
+  const tabs = {
+    onActivated: new FakeEvent(),
+    onRemoved: new FakeEvent(),
+    onAttached: new FakeEvent(),
+    onReplaced: new FakeEvent(),
+    async get(tabId) {
+      if (tabId === 41) {
+        return { id: 41, url: "https://claude.ai/chat/test", windowId: 9, active: true };
+      }
+      if (tabId === 42) {
+        return { id: 42, url: "https://example.com/", windowId: 9, active: true };
+      }
+      throw new Error("no such tab");
+    },
+    async query() {
+      return [{ id: 41, url: "https://claude.ai/chat/test", windowId: 9, active: true }];
+    }
+  };
+  const trustedStorage = {
+    async setAccessLevel() {},
+    async get() { return {}; },
+    async set() {},
+    async remove() {}
+  };
+
+  globalThis.chrome = {
+    runtime,
+    tabs,
+    sidePanel: { async setPanelBehavior() {} },
+    storage: { local: trustedStorage, session: trustedStorage }
+  };
+
+  try {
+    await import(new URL(`../sw.js?test=${Date.now()}-bindfail`, import.meta.url));
+    await nextTurn();
+
+    const panel = new FakePort("zh2en-panel");
+    runtime.onConnect.emit(panel);
+    panel.send({ type: "PANEL_HELLO", windowId: 9 });
+
+    const writer41 = new FakePort("zh2en-writer", { tab: { id: 41 }, documentId: "doc-41" });
+    runtime.onConnect.emit(writer41);
+    writer41.send({
+      type: "WRITER_HELLO",
+      writerSession: "writer-41",
+      state: { composerReady: true, currentText: "old english", targetEpoch: 0, pluginOwned: true }
+    });
+
+    panel.send({ type: "BIND_TAB", tabId: 41 });
+    await nextTurn();
+    assert.equal(panel.last("BIND_RESULT")?.ok, true);
+
+    // Rebinding onto a non-claude.ai tab fails. The panel treats any failure
+    // other than writer_not_ready as fully unbound (target.tabId = null), so
+    // the old tab's lease and ownership must not survive in the service
+    // worker: a retained owner would keep forwarding writer 41's events
+    // (e.g. SEND_CONFIRMED → draft archival) past the panel's ghost filter.
+    panel.send({ type: "BIND_TAB", tabId: 42 });
+    await nextTurn();
+    const failedBind = panel.last("BIND_RESULT");
+    assert.equal(failedBind?.ok, false);
+    assert.equal(failedBind?.code, "not_claude");
+    assert.ok(writer41.last("DETACH"), "old writer must be detached on failed rebind");
+
+    const messagesBeforeGhost = panel.messages.length;
+    writer41.send({
+      type: "SEND_CONFIRMED",
+      writerSession: "writer-41",
+      targetEpoch: 1,
+      sentText: "old english",
+      intentKind: "keyboard"
+    });
+    await nextTurn();
+    assert.equal(
+      panel.messages.slice(messagesBeforeGhost).some((message) => message.type === "SEND_CONFIRMED"),
+      false,
+      "events from the detached writer must no longer reach the panel"
+    );
+
+    // Writer commands must fail closed instead of routing to the old tab.
+    panel.send({ type: "GET_TARGET_TEXT", requestId: "after-fail", deadline: Date.now() + 5000 });
+    await nextTurn();
+    const commandResult = panel.last("GET_TARGET_TEXT_RESULT");
+    assert.equal(commandResult?.ok, false);
+    assert.equal(commandResult?.code, "target_unavailable");
+
+    // The tab_unavailable path must release the lease the same way.
+    panel.send({ type: "BIND_TAB", tabId: 41 });
+    await nextTurn();
+    assert.equal(panel.last("BIND_RESULT")?.ok, true);
+    const detachCountBefore = writer41.messages.filter((m) => m.type === "DETACH").length;
+    panel.send({ type: "BIND_TAB", tabId: 77 });
+    await nextTurn();
+    assert.equal(panel.last("BIND_RESULT")?.code, "tab_unavailable");
+    assert.equal(
+      writer41.messages.filter((m) => m.type === "DETACH").length,
+      detachCountBefore + 1,
+      "tab_unavailable must also detach the previous binding"
+    );
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});

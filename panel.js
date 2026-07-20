@@ -180,6 +180,12 @@ const state = {
   detectedModels: [],
   formCapabilitySignature: null,
   formCapabilities: null,
+  // Snapshot of the capabilities as they exist in storage. Runtime learning
+  // mutates state.provider.capabilities in-memory only; an ordinary settings
+  // save must persist this snapshot, not the runtime-mutated values — only an
+  // explicit connection test (formCapabilities) may persist new learning.
+  persistedCapabilitySignature: null,
+  persistedCapabilities: null,
   formRequestEpoch: 0,
   formController: null,
   sourceRevision: 0,
@@ -724,6 +730,18 @@ function applyCapabilityPatch(patch, context) {
   if (context?.config) context.config.capabilities = clone(next);
 }
 
+function rememberPersistedCapabilities(provider) {
+  state.persistedCapabilitySignature = null;
+  state.persistedCapabilities = null;
+  try {
+    state.persistedCapabilitySignature = `${normalizeBaseUrl(provider.baseUrl)}\n${provider.modelTranslate || ""}`;
+    state.persistedCapabilities = clone(provider.capabilities);
+  } catch {
+    // A stored Base URL that predates current validation cannot anchor a
+    // capability snapshot; capabilities re-learn from defaults after a save.
+  }
+}
+
 function normalizedProviderSignature(provider) {
   return JSON.stringify(normalizeStoredProvider(provider));
 }
@@ -837,6 +855,7 @@ function scheduleExternalConfigurationReload(reasons) {
       invalidateFormRequests();
       invalidateRuntimeContext();
       state.provider = provider;
+      rememberPersistedCapabilities(provider);
       state.settings = {
         ...settings,
         backTranslationMode: normalizeBackTranslationMode(settings.backTranslationMode)
@@ -1516,6 +1535,13 @@ function scheduleTranslation() {
   const length = codePointLength(state.draft.source, state.settings.longTextThreshold);
   if (!state.draft.source.trim() || length > state.settings.longTextThreshold) return;
   if (state.cooldownUntil > Date.now()) return;
+  // Resume paths (Esc, 暂停 button, 自动 toggle) and a cancelled IME
+  // composition reach here with an unchanged draft. The current revision
+  // already has its English: re-issuing the request would bill a second time
+  // and could silently replace already-verified, already-synced English with
+  // a different regeneration. Explicit 立即翻译 still goes through
+  // translateNow directly and is not affected by this guard.
+  if (state.draft.english && state.draft.englishSourceRevision === state.sourceRevision) return;
 
   if (state.debounceTimer) clearTimeout(state.debounceTimer);
   const sentenceEnding = /[。！？!?]\s*$|\n\s*$/u.test(state.draft.source);
@@ -1590,6 +1616,11 @@ async function translateNow({ forceSync = false, forceOverwrite = false, reason 
 
   if (!providerContext.modelTranslate) {
     if (state.mainController === controller) state.mainController = null;
+    // This return sits after the abort of any previous run but before this
+    // run's try/finally. The aborted previous run no longer re-enables the
+    // button itself (its finally is identity-guarded), so restore it here —
+    // nothing is in flight anymore.
+    ui.translateButton.disabled = false;
     setStatus("请先在设置中选择主翻译模型", "error");
     openSettings();
     return;
@@ -1719,8 +1750,14 @@ async function translateNow({ forceSync = false, forceOverwrite = false, reason 
     }
     addDiagnostic(`翻译失败：${providerDiagnosticDetail(error)}`);
   } finally {
-    if (state.mainController === controller) state.mainController = null;
-    ui.translateButton.disabled = false;
+    // Both cleanups must be identity-guarded: when this run was superseded by
+    // a newer translateNow, that newer run still owns the disabled button. An
+    // unconditional re-enable here would drop the only lock against clicking
+    // in a third concurrent paid request while the newer one is in flight.
+    if (state.mainController === controller) {
+      state.mainController = null;
+      ui.translateButton.disabled = false;
+    }
   }
 }
 
@@ -2442,11 +2479,13 @@ function providerFromForm() {
   }
   const signature = `${baseUrl}\n${modelTranslate}`;
   let capabilities = clone(DEFAULT_PROVIDER.capabilities);
-  try {
-    const currentSignature = `${normalizeBaseUrl(state.provider.baseUrl)}\n${state.provider.modelTranslate || ""}`;
-    if (signature === currentSignature) capabilities = clone(state.provider.capabilities);
-  } catch {
-    // Keep unknown capabilities for a new or malformed previous provider.
+  // Carry over only what is actually persisted for this exact target. Reading
+  // state.provider.capabilities here would leak runtime-learned degradations
+  // (applyCapabilityPatch keeps them in-memory by design) into any ordinary
+  // settings save; only an explicit connection test may persist new learning,
+  // via the formCapabilities override below.
+  if (signature === state.persistedCapabilitySignature && state.persistedCapabilities) {
+    capabilities = clone(state.persistedCapabilities);
   }
   if (signature === state.formCapabilitySignature && state.formCapabilities) {
     capabilities = clone(state.formCapabilities);
@@ -2539,7 +2578,16 @@ async function saveSettingsFromForm(event) {
     if (!hadPermission) newlyGrantedPattern = nextPattern;
     const secret = await resolveFormSecret(provider);
     if (!secret) throw new Error("无法读取 API Key，请重新填写");
-    const previousPattern = permissionPatternForBaseUrl(state.provider.baseUrl);
+    // The stored Base URL may predate current validation rules (storage.js
+    // documents this) and fail to normalize. That must not brick saving the
+    // corrected URL from the form — it only means there is no valid previous
+    // origin pattern to revoke.
+    let previousPattern = null;
+    try {
+      previousPattern = permissionPatternForBaseUrl(state.provider.baseUrl);
+    } catch {
+      previousPattern = null;
+    }
     const credentialId = randomId("credential");
     const providerToSave = { ...provider, credentialId };
     markExpectedConfigurationWrite(settings, providerToSave);
@@ -2550,11 +2598,12 @@ async function saveSettingsFromForm(event) {
       credentialId
     );
     newlyGrantedPattern = null;
-    if (previousPattern !== nextPattern) {
+    if (previousPattern && previousPattern !== nextPattern) {
       await chrome.permissions.remove({ origins: [previousPattern] }).catch(() => false);
     }
     state.settings = savedConfiguration.settings;
     state.provider = savedConfiguration.provider;
+    rememberPersistedCapabilities(savedConfiguration.provider);
     state.externalConfigurationChanged = false;
     // Keep the expected-write descriptor alive briefly. Chrome may deliver
     // storage.onChanged after the save promise resolves. It is signature- and
@@ -2856,8 +2905,16 @@ async function diagnosticWrite() {
     state.target.currentText = result.readback;
     state.diagnosticActive = true;
     state.diagnosticText = text;
+    // The composer no longer holds the draft's English (nor the user's manual
+    // content after the confirmed overwrite above). Leaving targetPhase on
+    // "synced" would keep a green 已同步 badge for text that is gone, and a
+    // surviving manual banner would let 作为核对基线 adopt this diagnostic
+    // sentence as if it were the user's English.
+    state.targetPhase = "stale-uncleared";
+    hideManualBanner();
     addDiagnostic(`诊断写入成功：${result.strategy}${result.focusUsed ? "（聚焦）" : "（无焦点）"}`);
     setStatus("诊断短句已写入；不会自动发送", "ready");
+    updateDraftUI();
   } else {
     addDiagnostic(`诊断写入失败：${result.code || "unknown"}`);
     setStatus("诊断写入失败，请查看诊断记录", "error");
@@ -2880,8 +2937,12 @@ async function diagnosticClear() {
     state.target.currentText = "";
     state.diagnosticActive = false;
     state.diagnosticText = "";
+    // The composer is empty now; a lingering "synced"/"stale-uncleared" phase
+    // would misdescribe it (green badge or a stale-text banner with no text).
+    state.targetPhase = "empty";
     addDiagnostic(`插件拥有的目标文字已清除${result.focusUsed ? "（短暂使用焦点）" : ""}`);
     setStatus("目标输入框已清除", "ready");
+    updateDraftUI();
   } else {
     addDiagnostic(`清除失败：${result.code || "unknown"}`);
     setStatus(
@@ -3128,6 +3189,7 @@ async function initialize() {
     backTranslationMode: normalizeBackTranslationMode(settings.backTranslationMode)
   };
   state.provider = provider;
+  rememberPersistedCapabilities(provider);
   state.draft = normalizeDraft(draftState.activeDraft);
   state.history = draftState.history;
   state.diagnostics = draftState.diagnostics;

@@ -84,6 +84,12 @@ async function bindPanelToTab(
     tab = await chrome.tabs.get(tabId);
   } catch {
     if (!bindingIsCurrent(panel, generation, bindRequestId, tabId)) return;
+    // The panel treats any failure other than writer_not_ready as fully
+    // unbound. Releasing the previous lease here keeps the service worker in
+    // agreement; otherwise the old tab's writer would keep this panel as its
+    // owner and its events (e.g. SEND_CONFIRMED) would still reach a panel
+    // whose ghost-event filter no longer has a tabId to compare against.
+    detachPanel(panel, "bind_failed");
     post(panel.port, {
       type: "BIND_RESULT",
       ok: false,
@@ -101,6 +107,9 @@ async function bindPanelToTab(
   if (!bindingIsCurrent(panel, generation, bindRequestId, tabId)) return;
 
   if (!isClaudeUrl(tab.url ?? "")) {
+    // Same contract as the tab_unavailable branch above: a failed bind must
+    // not leave the previous tab's lease and ownership alive.
+    detachPanel(panel, "bind_failed");
     post(panel.port, {
       type: "BIND_RESULT",
       ok: false,
