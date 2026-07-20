@@ -88,6 +88,7 @@
         <div class="button-row">
           <button id="syncButton" class="primary-button" type="button">同步到 Claude</button>
           <button id="copyEnglishButton" class="secondary-button" type="button">复制英文</button>
+          <button id="clearTargetButton" class="danger-button" type="button" title="清空 Claude 输入框中的全部内容（需确认）">清空输入框</button>
         </div>
       </section>
 
@@ -227,7 +228,6 @@
         <label class="inline-checkbox"><input id="streamPreview" type="checkbox">生成过程中流式显示英文预览（不影响写入 Claude 的完整校验）</label>
         <label class="inline-checkbox"><input id="strictReviewGate" type="checkbox">严格评审：有纠错/歧义/数量提醒时不自动同步，等我点“同步到 Claude”（默认关闭，提醒仍会醒目显示）</label>
         <label class="inline-checkbox"><input id="allowFocusWrite" type="checkbox">无焦点策略失败时，允许短暂聚焦 Claude 输入框</label>
-        <label class="inline-checkbox"><input id="clearStaleTarget" type="checkbox">中文一修改，就尝试无焦点清除 Claude 中的旧译文</label>
         <label>保护词（每行一个，原样保留）
           <textarea id="protectedTerms" rows="4" spellcheck="false" placeholder="内部项目名&#10;产品名&#10;专有缩写"></textarea>
         </label>

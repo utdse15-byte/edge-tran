@@ -206,6 +206,7 @@ async function isBoundTabActive(panel) {
 const WRITER_COMMANDS = new Set([
   "WRITE_TARGET",
   "CLEAR_TARGET_IF_OWNED",
+  "CLEAR_TARGET_FORCE",
   "GET_TARGET_TEXT",
   "SET_BASELINE",
   "START_MANUAL_BIND",

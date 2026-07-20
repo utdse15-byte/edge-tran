@@ -94,6 +94,7 @@ const ui = {
   englishText: $("#englishText"),
   syncBadge: $("#syncBadge"),
   syncButton: $("#syncButton"),
+  clearTargetButton: $("#clearTargetButton"),
   copyEnglishButton: $("#copyEnglishButton"),
   backText: $("#backText"),
   backBadge: $("#backBadge"),
@@ -137,7 +138,6 @@ const ui = {
   streamPreview: $("#streamPreview"),
   strictReviewGate: $("#strictReviewGate"),
   allowFocusWrite: $("#allowFocusWrite"),
-  clearStaleTarget: $("#clearStaleTarget"),
   protectedTerms: $("#protectedTerms"),
   clearKeyButton: $("#clearKeyButton"),
   historyList: $("#historyList"),
@@ -254,7 +254,6 @@ const state = {
   closing: false,
   pendingRequests: new Map(),
   debounceTimer: null,
-  staleClearTimer: null,
   persistTimer: null,
   settingsSaveQueue: Promise.resolve(),
   draftSaveQueue: Promise.resolve(),
@@ -696,9 +695,7 @@ function abortInFlight() {
   if (["waiting", "working"].includes(state.backPhase)) state.backPhase = "idle";
   if (["waiting", "working"].includes(state.translatePhase)) state.translatePhase = "idle";
   if (state.debounceTimer) clearTimeout(state.debounceTimer);
-  if (state.staleClearTimer) clearTimeout(state.staleClearTimer);
   state.debounceTimer = null;
-  state.staleClearTimer = null;
 }
 
 async function hasProviderPermission(baseUrl) {
@@ -1240,7 +1237,14 @@ function updateTargetFromWriterState(message) {
     && state.targetPhase !== "manual"
     && state.targetPhase !== "syncing"
   ) {
-    showManualBanner(state.target.currentText);
+    // v0.2.12: pre-existing user content in the composer is a NORMAL state,
+    // not a conflict. Adopt the protective "manual" phase quietly — no banner,
+    // no pause, no overwrite prompt. Auto-sync degrades to preview; the
+    // explicit 同步(覆盖) and 清空输入框 buttons are the only ways to touch it.
+    state.manualText = state.target.currentText;
+    state.targetPhase = "manual";
+    setStatus("Claude 输入框中已有内容；新译文只停在预览，需要时点“同步到 Claude”覆盖或用“清空输入框”", "idle");
+    updateDraftUI();
   }
   renderDiagnostics();
 }
@@ -1258,7 +1262,8 @@ function handlePanelMessage(message) {
     "SEND_CONFIRMED",
     "WRITER_SESSION_CHANGED",
     "WRITE_TARGET_RESULT",
-    "CLEAR_TARGET_IF_OWNED_RESULT"
+    "CLEAR_TARGET_IF_OWNED_RESULT",
+    "CLEAR_TARGET_FORCE_RESULT"
   ]);
   if (
     writerEventTypes.has(message?.type)
@@ -1340,10 +1345,10 @@ function handlePanelMessage(message) {
         state.targetPhase = state.target.pluginOwned
           ? (englishCurrent ? "synced" : (state.target.currentText ? "stale-uncleared" : "empty"))
           : "empty";
-        if (state.targetPhase === "stale-uncleared" && state.settings.clearStaleTarget) {
-          scheduleStaleTargetClear();
-        }
-        setStatus(state.target.composerReady ? "Claude 输入框已绑定" : "已绑定，但尚未找到输入框", "idle");
+        // BIND_RESULT may carry a pre-attach state snapshot; the writer's
+        // post-attach WRITER_STATE follows within moments and corrects it, so
+        // an unlocated composer here is "still locating", not a verdict.
+        setStatus(state.target.composerReady ? "Claude 输入框已绑定" : "已绑定，正在定位输入框…", "idle");
       }
       updateTargetUI();
       updateDraftUI();
@@ -1380,6 +1385,7 @@ function handlePanelMessage(message) {
       }
       break;
     case "CLEAR_TARGET_IF_OWNED_RESULT":
+    case "CLEAR_TARGET_FORCE_RESULT":
       if (message.ok) {
         state.target.writerSession = message.writerSession ?? state.target.writerSession;
         state.target.targetEpoch = message.targetEpoch ?? state.target.targetEpoch + 1;
@@ -1606,22 +1612,17 @@ function scheduleBindRetry() {
   }, delay);
 }
 
+// v0.2.12: only the explicit 清空草稿 flow calls this — every automatic
+// invocation was removed so nothing visible ever disappears on its own. It
+// still refuses anything that is not the plugin's own last-written text.
 async function clearStaleTargetOwned({
-  force = false,
-  // Automatic stale cleanup must never pull focus out of the side panel. An
-  // explicit user action may opt into the already-diagnosed focus path.
+  // Cleanup must never pull focus out of the side panel. An explicit user
+  // action may opt into the already-diagnosed focus path.
   allowFocus = false
 } = {}) {
   if (state.clearPromise) return state.clearPromise;
 
   const task = (async () => {
-    if (!force && !state.settings.clearStaleTarget) {
-      if (state.target.pluginOwned) {
-        state.targetPhase = "stale-uncleared";
-        updateDraftUI();
-      }
-      return { attempted: false, ok: false, code: "automatic_clear_disabled" };
-    }
     if (
       !state.target.bound
       || !state.target.active
@@ -1673,7 +1674,7 @@ async function clearStaleTargetOwned({
       state.target.pluginOwned = false;
       state.target.currentText = "";
       state.targetPhase = "empty";
-      bannerMessage = "中文已修改；Claude 中的旧译文已清除，正在等待新译文。";
+      bannerMessage = "Claude 中的旧译文已按操作清除。";
       addDiagnostic(`旧译文已安全清除${result.focusUsed ? "（短暂使用焦点）" : "（无焦点）"}`);
     } else if (["clear_failed_not_restored", "write_interrupted"].includes(result.code)) {
       state.target.targetEpoch = resultEpoch ?? state.target.targetEpoch;
@@ -1706,21 +1707,56 @@ async function clearStaleTargetOwned({
   }
 }
 
-function scheduleStaleTargetClear({ force = false } = {}) {
-  if (state.staleClearTimer) clearTimeout(state.staleClearTimer);
-  const revision = state.sourceRevision;
-  const targetContext = targetContextSnapshot();
-  const delay = Math.max(250, state.settings.writeIdleGuardMs);
-  state.staleClearTimer = setTimeout(() => {
-    state.staleClearTimer = null;
-    if (
-      revision !== state.sourceRevision
-      || state.composing
-      || !state.target.pluginOwned
-      || !targetContextMatches(targetContext, state.target)
-    ) return;
-    void clearStaleTargetOwned({ force, allowFocus: false });
-  }, delay);
+// Explicit 清空输入框 button: the ONLY path that may remove content the
+// plugin did not write, and it never runs without a confirm.
+async function clearTargetExplicit() {
+  if (!state.target.bound || !state.target.connected || !state.target.composerReady) {
+    setStatus("尚未绑定 Claude 输入框，无法清空", "error");
+    return;
+  }
+  if (!confirm("清空 Claude 输入框中的全部内容？此操作不可撤销。")) return;
+  const expectedTargetContext = targetContextSnapshot();
+  const previousPanelFocus = capturePanelFocus();
+  const result = await requestWriter("CLEAR_TARGET_FORCE", {
+    expectedWriterSession: expectedTargetContext.writerSession,
+    expectedTargetEpoch: expectedTargetContext.targetEpoch,
+    allowFocus: Boolean(state.settings.allowFocusWrite)
+  });
+  restorePanelFocus(previousPanelFocus, result.focusUsed);
+  const sameIdentity = targetContextMatches(
+    { tabId: expectedTargetContext.tabId, writerSession: expectedTargetContext.writerSession },
+    state.target
+  );
+  if (!sameIdentity) {
+    setStatus("清空期间 Claude 目标已变化，请重新确认输入框状态", "error");
+    void requestWriter("REQUEST_WRITER_STATE", {});
+    return;
+  }
+  if (result.ok) {
+    const resultEpoch = Number.isInteger(result.targetEpoch)
+      ? result.targetEpoch
+      : state.target.targetEpoch + 1;
+    state.target.targetEpoch = resultEpoch;
+    state.target.pluginOwned = false;
+    state.target.currentText = "";
+    state.targetPhase = "empty";
+    hideManualBanner();
+    updateStaleBanner("");
+    setStatus("已按你的操作清空 Claude 输入框", "idle");
+    addDiagnostic("用户显式清空 Claude 输入框");
+  } else {
+    setStatus(
+      result.code === "protected_content_present"
+        ? "输入框含附件或不可安全替换的内容，未清空；请在页面中手动处理"
+        : result.code === "focus_write_disabled"
+          ? "当前富文本输入框需要聚焦写入才能清空；请先完成页面诊断并在设置中启用"
+          : `清空失败：${result.code || "未知"}`,
+      "error"
+    );
+    void requestWriter("REQUEST_WRITER_STATE", {});
+  }
+  updateTargetUI();
+  updateDraftUI();
 }
 
 function scheduleTranslation() {
@@ -2084,13 +2120,9 @@ async function syncEnglishNow({
     return false;
   }
 
-  // A delayed stale-clear and a fresh write must never race with the same old
-  // targetEpoch. Cancel a not-yet-started clear and wait for an already-started
-  // one to finish before taking the write CAS snapshot.
-  if (state.staleClearTimer) {
-    clearTimeout(state.staleClearTimer);
-    state.staleClearTimer = null;
-  }
+  // An in-flight explicit clear and a fresh write must never race with the
+  // same old targetEpoch: wait for a started clear to finish before taking
+  // the write CAS snapshot.
   if (state.clearPromise) {
     try {
       await state.clearPromise;
@@ -2206,8 +2238,10 @@ async function syncEnglishNow({
       state.target.strategy = result.strategy;
       state.target.currentText = result.readback;
       state.targetPhase = "stale-uncleared";
-      addDiagnostic("中文在 Writer 响应返回前已变化；正在无焦点清除刚写入的旧英文");
-      await clearStaleTargetOwned({ force: true, allowFocus: false });
+      // v0.2.12: no automatic deletion — the newer translation in flight will
+      // simply replace this plugin-owned text on its own sync.
+      addDiagnostic("中文在 Writer 响应返回前已变化；旧英文保留，等待新译文覆盖");
+      updateStaleBanner("刚写入的英文对应旧版中文；新译文完成后会直接覆盖。");
     } else if (state.targetPhase !== "manual") {
       state.targetPhase = "stale";
     }
@@ -2424,8 +2458,10 @@ function handleSourceChange() {
     if (state.targetPhase === "manual") {
       state.targetPhase = "manual";
     } else if (state.target.pluginOwned) {
+      // v0.2.12: the old translation stays in Claude untouched until the NEW
+      // translation replaces it. Automatic deletion is retired — nothing the
+      // user can see disappears without an explicit button press.
       state.targetPhase = "stale-uncleared";
-      if (!state.composing && state.settings.clearStaleTarget) scheduleStaleTargetClear();
     } else {
       state.targetPhase = "stale";
     }
@@ -2557,7 +2593,6 @@ async function clearCurrentDraft() {
   let clearResult = null;
   if (state.target.pluginOwned) {
     clearResult = await clearStaleTargetOwned({
-      force: true,
       allowFocus: Boolean(state.settings.allowFocusWrite)
     });
   }
@@ -2757,7 +2792,6 @@ function fillSettingsForm() {
   ui.streamPreview.checked = Boolean(state.settings.streamPreview);
   ui.strictReviewGate.checked = Boolean(state.settings.strictReviewGate);
   ui.allowFocusWrite.checked = Boolean(state.settings.allowFocusWrite);
-  ui.clearStaleTarget.checked = Boolean(state.settings.clearStaleTarget);
   ui.protectedTerms.value = (state.settings.protectedTerms ?? []).join("\n");
   ui.apiKey.value = "";
   ui.providerTestResult.textContent = "";
@@ -2880,7 +2914,6 @@ function settingsFromForm() {
     streamPreview: ui.streamPreview.checked,
     strictReviewGate: ui.strictReviewGate.checked,
     allowFocusWrite: ui.allowFocusWrite.checked,
-    clearStaleTarget: ui.clearStaleTarget.checked,
     protectedTerms: ui.protectedTerms.value
       .split(/\r?\n/)
       .map((term) => [...term.trim()].slice(0, 200).join(""))
@@ -3228,9 +3261,6 @@ function renderHistory() {
           ? "off"
           : "idle";
       state.targetPhase = state.target.pluginOwned ? "stale-uncleared" : "stale";
-      if (state.target.pluginOwned && state.settings.clearStaleTarget) {
-        scheduleStaleTargetClear({ force: true });
-      }
       schedulePersist();
       updateDraftUI({ preserveSourceSelection: false });
       setStatus("历史草稿已恢复；确认无误可直接编辑继续（输入即恢复自动流程）", "paused");
@@ -3474,7 +3504,6 @@ function bindEvents() {
   ui.sourceText.addEventListener("compositionend", () => {
     state.composing = false;
     handleSourceChange();
-    if (state.draft.english && state.settings.clearStaleTarget) scheduleStaleTargetClear();
     scheduleTranslation();
   });
   ui.sourceText.addEventListener("input", () => {
@@ -3549,6 +3578,7 @@ function bindEvents() {
     await syncEnglish({ forceOverwrite: force, revision: state.sourceRevision });
   });
   ui.copyEnglishButton.addEventListener("click", () => void copyEnglish());
+  ui.clearTargetButton.addEventListener("click", () => void clearTargetExplicit());
 
   ui.keepManualButton.addEventListener("click", () => void keepManualVersion());
   ui.regenerateButton.addEventListener("click", () => {
