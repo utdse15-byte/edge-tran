@@ -124,6 +124,7 @@ const ui = {
   longTextThreshold: $("#longTextThreshold"),
   requestTimeoutMs: $("#requestTimeoutMs"),
   backTranslateDelayMs: $("#backTranslateDelayMs"),
+  streamPreview: $("#streamPreview"),
   allowFocusWrite: $("#allowFocusWrite"),
   clearStaleTarget: $("#clearStaleTarget"),
   protectedTerms: $("#protectedTerms"),
@@ -190,6 +191,7 @@ const state = {
   persistedCapabilities: null,
   formRequestEpoch: 0,
   formController: null,
+  translationCache: new Map(),
   sourceRevision: 0,
   composing: false,
   paused: false,
@@ -565,6 +567,7 @@ function showManualBanner(text) {
   state.manualText = String(text ?? "");
   state.targetPhase = "manual";
   state.paused = true;
+  state.pausedByTargetLoss = false;
   ui.manualBanner.classList.remove("hidden");
   setStatus("检测到人工修改，自动覆盖已暂停", "paused");
   updateDraftUI();
@@ -724,7 +727,53 @@ function clearCooldown({ announce = false } = {}) {
 function invalidateRuntimeContext({ abort = true } = {}) {
   state.providerEpoch += 1;
   clearCooldown();
+  // The cache key includes the provider target, but a provider/settings
+  // change is still the natural trust boundary for replayed results.
+  state.translationCache.clear();
   if (abort) abortInFlight();
+}
+
+const TRANSLATION_CACHE_LIMIT = 50;
+
+// Session-scoped translation memory. Undo/redo typing, restoring drafts and
+// repeated phrases replay instantly instead of re-billing a Provider request.
+// Entries are full result objects; corrections and warnings replay with them
+// so every downstream safety check behaves exactly like a fresh result.
+function translationCacheKey(providerContext, source) {
+  try {
+    return JSON.stringify([
+      normalizeBaseUrl(providerContext.provider.baseUrl),
+      normalizedApiProtocol(providerContext.provider),
+      providerContext.modelTranslate,
+      providerContext.backTranslationMode,
+      providerContext.settings.protectedTerms,
+      [...state.literalFragments].sort(),
+      normalizeText(source)
+    ]);
+  } catch {
+    return null;
+  }
+}
+
+function readTranslationCache(key) {
+  if (!key || !state.translationCache.has(key)) return null;
+  const entry = state.translationCache.get(key);
+  state.translationCache.delete(key);
+  state.translationCache.set(key, entry);
+  return clone(entry);
+}
+
+function writeTranslationCache(key, result) {
+  if (!key || !result) return;
+  // capabilityPatch/usage are request-time facts, not translation content;
+  // replaying a stale patch could resurrect a degradation the gateway no
+  // longer needs.
+  const entry = clone({ ...result, capabilityPatch: null, usage: null });
+  state.translationCache.delete(key);
+  state.translationCache.set(key, entry);
+  while (state.translationCache.size > TRANSLATION_CACHE_LIMIT) {
+    state.translationCache.delete(state.translationCache.keys().next().value);
+  }
 }
 
 function applyCapabilityPatch(patch, context) {
@@ -876,6 +925,7 @@ function scheduleExternalConfigurationReload(reasons) {
         backTranslationMode: normalizeBackTranslationMode(settings.backTranslationMode)
       };
       state.paused = true;
+      state.pausedByTargetLoss = false;
       state.externalConfigurationChanged = true;
       state.formCapabilitySignature = null;
       state.formCapabilities = null;
@@ -892,6 +942,7 @@ function scheduleExternalConfigurationReload(reasons) {
       invalidateFormRequests();
       invalidateRuntimeContext();
       state.paused = true;
+      state.pausedByTargetLoss = false;
       setStatus("检测到配置变化，但重新读取失败；自动流程已暂停", "error");
       addDiagnostic(`外部配置变化后读取失败：${String(error?.message || "storage_error").slice(0, 120)}`);
     }
@@ -920,7 +971,7 @@ function providerErrorMessage(error) {
     case "network_error":
       return "无法连接 Provider";
     case "endpoint_not_found":
-      return "Base URL 或 Chat Completions 路径不正确";
+      return "Base URL 或接口路径不正确；请核对所选“接口协议”对应的端点（/chat/completions 或 /responses）";
     case "model_not_found":
       return "模型不存在、不可用，或当前 API Key 无权访问";
     case "incompatible_request":
@@ -1234,6 +1285,7 @@ function handlePanelMessage(message) {
       if (message.ok) {
         abortInFlight();
         state.paused = true;
+        state.pausedByTargetLoss = false;
         state.target.writerSession = message.writerSession ?? state.target.writerSession;
         state.target.targetEpoch = message.targetEpoch ?? state.target.targetEpoch + 1;
         state.target.pluginOwned = true;
@@ -1279,6 +1331,7 @@ function handlePanelMessage(message) {
     case "TARGET_CLEARED":
       abortInFlight();
       state.paused = true;
+      state.pausedByTargetLoss = false;
       state.target.targetEpoch = message.targetEpoch ?? state.target.targetEpoch + 1;
       state.target.pluginOwned = false;
       state.target.currentText = "";
@@ -1365,7 +1418,10 @@ function handlePanelMessage(message) {
     case "TARGET_TAKEN":
       abortInFlight();
       // Remember whether this pause is newly caused by a recoverable
-      // connection loss. A user-initiated pause must never auto-resume.
+      // connection loss. A user-initiated pause — or any other pause reason,
+      // every one of which resets this flag — must never auto-resume: a stale
+      // flag surviving into an unrelated pause (e.g. external configuration
+      // review) would let a later successful rebind cancel that pause.
       state.pausedByTargetLoss = !state.paused
         && message.type === "TARGET_UNAVAILABLE"
         && Boolean(message.recoverable);
@@ -1538,6 +1594,7 @@ async function clearStaleTargetOwned({
       state.target.pluginOwned = false;
       state.targetPhase = "manual";
       state.paused = true;
+      state.pausedByTargetLoss = false;
       bannerMessage = "清理过程中 Claude 输入框发生变化，自动覆盖已停止；请人工核对当前内容。";
       addDiagnostic(`旧译文清理被中断或回滚失败：${result.code}`);
       void requestWriter("REQUEST_WRITER_STATE", {});
@@ -1681,48 +1738,74 @@ async function translateNow({ forceSync = false, forceOverwrite = false, reason 
   setStatus(reason === "literal_retry" ? "正在按字面重新翻译…" : "正在翻译…", "working");
   ui.translateButton.disabled = true;
 
+  const cacheKey = translationCacheKey(providerContext, sourceSnapshot);
+
   try {
-    const apiKey = await getActiveSecret(providerContext.provider);
-    if (
-      controller.signal.aborted
-      || revision !== state.sourceRevision
-      || sourceSnapshot !== state.draft.source
-      || !providerContextIsCurrent(providerContext)
-    ) return;
-    if (!apiKey) {
-      setStatus("请先配置 API Key", "error");
-      openSettings();
-      return;
+    // A cache hit replays a full earlier result for the identical provider
+    // target, mode, protections and normalized source — no network, no key,
+    // no permission needed. Corrections/warnings replay with it, so the
+    // review gate below applies exactly as it did the first time.
+    let result = readTranslationCache(cacheKey);
+    if (result) {
+      addDiagnostic("翻译缓存命中，未发起 Provider 请求");
+    } else {
+      const apiKey = await getActiveSecret(providerContext.provider);
+      if (
+        controller.signal.aborted
+        || revision !== state.sourceRevision
+        || normalizeText(sourceSnapshot) !== normalizeText(state.draft.source)
+        || !providerContextIsCurrent(providerContext)
+      ) return;
+      if (!apiKey) {
+        setStatus("请先配置 API Key", "error");
+        openSettings();
+        return;
+      }
+
+      const permitted = await hasProviderPermission(providerContext.provider.baseUrl);
+      if (
+        controller.signal.aborted
+        || revision !== state.sourceRevision
+        || normalizeText(sourceSnapshot) !== normalizeText(state.draft.source)
+        || !providerContextIsCurrent(providerContext)
+      ) return;
+      if (!permitted) {
+        setStatus("Provider 域名权限已缺失，请在设置中重新保存或检测模型", "error");
+        openSettings();
+        return;
+      }
+
+      result = await runTranslationWithRetry({
+        source: sourceSnapshot,
+        config: providerContext.config,
+        apiKey,
+        model: providerContext.modelTranslate,
+        protectedTerms: providerContext.settings.protectedTerms,
+        literalFragments: [...state.literalFragments],
+        backTranslationMode: providerContext.backTranslationMode,
+        // Streamed preview only: the adopted English still comes exclusively
+        // from the fully parsed and validated final response below.
+        onEnglishPreview: providerContext.settings.streamPreview
+          ? (previewText) => {
+              if (
+                controller.signal.aborted
+                || revision !== state.sourceRevision
+                || state.mainController !== controller
+              ) return;
+              ui.englishText.value = previewText;
+            }
+          : null,
+        signal: controller.signal
+      }, revision, controller, providerContext);
+      // Cache before the staleness guards: a superseded result still warms
+      // the cache for its exact source, so the money spent is not wasted.
+      writeTranslationCache(cacheKey, result);
     }
 
-    const permitted = await hasProviderPermission(providerContext.provider.baseUrl);
     if (
       controller.signal.aborted
       || revision !== state.sourceRevision
-      || sourceSnapshot !== state.draft.source
-      || !providerContextIsCurrent(providerContext)
-    ) return;
-    if (!permitted) {
-      setStatus("Provider 域名权限已缺失，请在设置中重新保存或检测模型", "error");
-      openSettings();
-      return;
-    }
-
-    const result = await runTranslationWithRetry({
-      source: sourceSnapshot,
-      config: providerContext.config,
-      apiKey,
-      model: providerContext.modelTranslate,
-      protectedTerms: providerContext.settings.protectedTerms,
-      literalFragments: [...state.literalFragments],
-      backTranslationMode: providerContext.backTranslationMode,
-      signal: controller.signal
-    }, revision, controller, providerContext);
-
-    if (
-      controller.signal.aborted
-      || revision !== state.sourceRevision
-      || sourceSnapshot !== state.draft.source
+      || normalizeText(sourceSnapshot) !== normalizeText(state.draft.source)
       || !providerContextIsCurrent(providerContext)
     ) return;
 
@@ -1757,6 +1840,26 @@ async function translateNow({ forceSync = false, forceOverwrite = false, reason 
     schedulePersist();
     updateDraftUI();
 
+    // Review gate: corrections, ambiguities and quantity/echo warnings are
+    // approvals to obtain, not notifications to file after the fact. With any
+    // of them pending, the English stays in the preview and the user's own
+    // 同步到 Claude click is the explicit approval that releases it.
+    const reviewRequired = result.corrections.length > 0
+      || result.ambiguities.length > 0
+      || result.warnings.some((warning) => /数字|复述|回答式|语序/.test(warning));
+    if (reviewRequired) {
+      state.targetPhase = "ready";
+      setStatus("翻译完成，但存在需人工确认的纠错/歧义/数量提示；请核对后点“同步到 Claude”", "paused");
+      updateDraftUI();
+      if (providerContext.backTranslationMode === BACK_TRANSLATION_MODES.INDEPENDENT) {
+        scheduleBackTranslation(revision, result.english, providerContext, {
+          kind: "independent",
+          useDelay: true
+        });
+      }
+      return;
+    }
+
     const shouldSync = forceSync || providerContext.settings.autoSync;
     if (shouldSync) {
       await syncEnglish({
@@ -1770,7 +1873,7 @@ async function translateNow({ forceSync = false, forceOverwrite = false, reason 
     if (
       controller.signal.aborted
       || revision !== state.sourceRevision
-      || sourceSnapshot !== state.draft.source
+      || normalizeText(sourceSnapshot) !== normalizeText(state.draft.source)
       || !providerContextIsCurrent(providerContext)
     ) return;
 
@@ -1800,6 +1903,9 @@ async function translateNow({ forceSync = false, forceOverwrite = false, reason 
       updateDraftUI();
     }
     addDiagnostic(`翻译失败：${providerDiagnosticDetail(error)}`);
+    // A failed run may have left streamed preview text in the textarea;
+    // redraw from state so the preview never outlives its request.
+    updateDraftUI();
   } finally {
     // Both cleanups must be identity-guarded: when this run was superseded by
     // a newer translateNow, that newer run still owns the disabled button. An
@@ -2045,6 +2151,7 @@ async function syncEnglishNow({
     state.target.targetEpoch = resultEpoch ?? state.target.targetEpoch;
     state.target.pluginOwned = false;
     state.paused = true;
+    state.pausedByTargetLoss = false;
     state.targetPhase = "manual";
     setStatus("写入被中断或未能完整恢复，请人工核对 Claude 输入框", "error");
     void requestWriter("REQUEST_WRITER_STATE", {});
@@ -2189,6 +2296,18 @@ function scheduleBackTranslation(
 function handleSourceChange() {
   const value = ui.sourceText.value;
   if (value === state.draft.source) return;
+  // Trailing whitespace/blank-line edits do not change what gets translated:
+  // every comparison that matters normalizes first. Keeping the revision
+  // stable preserves current English, keeps any in-flight request adoptable,
+  // and skips an entire paid re-translation for a semantically no-op edit.
+  if (normalizeText(value) === normalizeText(state.draft.source)) {
+    state.draft.source = value;
+    state.draft.updatedAt = Date.now();
+    state.lastInputAt = Date.now();
+    schedulePersist();
+    updateDraftUI();
+    return;
+  }
   state.sourceRevision += 1;
   state.lastInputAt = Date.now();
   state.literalFragments.clear();
@@ -2302,6 +2421,7 @@ async function archiveUncertainSend(sentText, details = {}) {
   }
 
   state.paused = true;
+  state.pausedByTargetLoss = false;
   state.targetPhase = "empty";
   state.draft.warnings = [...new Set([
     ...state.draft.warnings,
@@ -2367,6 +2487,7 @@ async function clearCurrentDraft() {
     updateDraftUI({ preserveSourceSelection: false });
   } else {
     state.paused = true;
+    state.pausedByTargetLoss = false;
     state.targetPhase = "stale-uncleared";
     hideManualBanner();
     setStatus("侧栏草稿已清空，但 Claude 中仍保留旧英文", "error");
@@ -2474,6 +2595,7 @@ function fillSettingsForm() {
   ui.longTextThreshold.value = state.settings.longTextThreshold;
   ui.requestTimeoutMs.value = state.settings.requestTimeoutMs;
   ui.backTranslateDelayMs.value = state.settings.backTranslateDelayMs;
+  ui.streamPreview.checked = Boolean(state.settings.streamPreview);
   ui.allowFocusWrite.checked = Boolean(state.settings.allowFocusWrite);
   ui.clearStaleTarget.checked = Boolean(state.settings.clearStaleTarget);
   ui.protectedTerms.value = (state.settings.protectedTerms ?? []).join("\n");
@@ -2580,6 +2702,7 @@ function settingsFromForm() {
     longTextThreshold: clampInteger(ui.longTextThreshold.value, 500, 10000, DEFAULT_SETTINGS.longTextThreshold),
     requestTimeoutMs: clampInteger(ui.requestTimeoutMs.value, 5000, 120000, DEFAULT_SETTINGS.requestTimeoutMs),
     backTranslateDelayMs: clampInteger(ui.backTranslateDelayMs.value, 300, 5000, DEFAULT_SETTINGS.backTranslateDelayMs),
+    streamPreview: ui.streamPreview.checked,
     allowFocusWrite: ui.allowFocusWrite.checked,
     clearStaleTarget: ui.clearStaleTarget.checked,
     protectedTerms: ui.protectedTerms.value
@@ -2841,6 +2964,7 @@ function renderHistory() {
         model: item.model
       });
       state.paused = true;
+      state.pausedByTargetLoss = false;
       state.translatePhase = "idle";
       state.backPhase = state.draft.backTranslation
         ? "ready"
@@ -3018,6 +3142,7 @@ async function diagnosticClear() {
 
 async function keepManualVersion() {
   state.paused = true;
+  state.pausedByTargetLoss = false;
   state.targetPhase = "manual";
   hideManualBanner();
   setStatus("已保留 Claude 中的人工英文；自动同步保持暂停", "paused");
@@ -3065,6 +3190,7 @@ async function useManualAsBaseline() {
   state.backPhase = backMode === BACK_TRANSLATION_MODES.OFF ? "off" : "idle";
   state.targetPhase = "manual";
   state.paused = true;
+  state.pausedByTargetLoss = false;
   hideManualBanner();
   schedulePersist();
   updateDraftUI();

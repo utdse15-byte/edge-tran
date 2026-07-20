@@ -1,10 +1,10 @@
-# v0.2.2 人工测试清单
+# 人工测试清单（当前版本 0.2.8）
 
 自动测试覆盖翻译管线、Provider、密钥绑定、存储事务、Service Worker 租约和 Chromium 页面仿真。真实 Claude 账户中的“可见输入＝实际发送内容”仍必须由用户人工验证。
 
 ## A. 安装、升级与权限
 
-- [ ] `edge://extensions` 能无错误加载 v0.2.2。
+- [ ] `edge://extensions` 能无错误加载当前版本。
 - [ ] 从 v0.2.x 覆盖原目录升级后，Provider、模型、Key 和草稿仍存在。
 - [ ] 升级后明确保存一次配置，旧裸 Key 被迁移，翻译仍可使用。
 - [ ] 保存 Provider 时只请求该 Provider 的精确 Origin。
@@ -138,3 +138,15 @@
 - [ ] 关闭侧栏后无 Provider 请求、无持续 Writer observer、无写入。
 - [ ] Claude 标签页刷新后能自动恢复绑定或给出明确提示。
 - [ ] Claude 改版导致定位失败时，插件最多退化为预览/复制，不误写其他编辑框。
+
+## 接口协议（0.2.6+）
+
+- [ ] 设置中"接口协议"默认是 Chat Completions；保存后 Provider 摘要不出现 Responses 标记。
+- [ ] 切换为 Responses API 并连通测试：请求打到 `{baseUrl}/responses`，成功返回英文与回译。
+- [ ] 协议选错（Responses 端点配 Chat Completions 或反之）时，错误信息明确提示到设置中切换协议，且不自动重试。
+- [ ] Responses 模式下 o 系列模型（含 reasoning 输出项）翻译正常。
+
+## 自动化套件说明
+
+- `npm run verify` 只含 Node 测试、语法检查与静态审计。
+- `npm run verify:full` 追加 4 个 Chromium 冒烟/状态机套件（writer 定位/写入/发送确认、panel 状态机、换会话与断连恢复），**发布前必须跑 verify:full**。

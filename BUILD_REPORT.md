@@ -1,119 +1,20 @@
-# Build and validation report
+# Build Report
 
-- Version: **0.2.2**
-- Build date: **2026-07-19**
-- Node: **v22.16.0**
-- Python: **3.13.5**
-- Chromium validator: **144.0.7559.96**, Debian 13
+- Version: **0.2.8**
+- Date: 2026-07-20
+- Baseline: `npm run verify:full` 全部通过
+  - Node 测试（`node --test tests/*.test.js`）
+  - 语法检查（`scripts/check-syntax.js`）
+  - 静态审计（`scripts/audit.mjs`：版本一致性、清单资源、权限、CSP、安全不变量）
+  - 4 个 Chromium 套件（writer 冒烟 / writer 安全 / panel 冒烟 / panel 状态机）
 
-## Result summary
+## 版本内容
 
-| Check | Result |
-|---|---:|
-| JavaScript syntax | 12/12 files passed |
-| Node unit/integration tests | 52/52 passed |
-| Chromium Writer smoke | passed |
-| Chromium Writer safety suite | passed |
-| Chromium Panel smoke | passed |
-| Chromium Panel state-machine suite | passed |
-| Static manifest/security/resource audit | passed |
-| Chromium extension pack validation | passed |
-| Clean release-tree verification | passed |
-| Final ZIP extraction and full verification | passed |
-| ZIP integrity | passed |
-| Embedded API Key/private-key scan | passed |
-| Remote-code/dangerous DOM sink scan | passed |
-| Content-script storage/network boundary scan | passed |
+- 0.2.5：深度缺陷审查修复（1 高危 / 5 中危 / 7 低危），见 CHANGELOG。
+- 0.2.6：Responses API 支持与使用稳定性修复（按钮卡死回归、空态定位、换会话/断连恢复）。
+- 0.2.7：外部审计核验修复——暂停原因隔离、跨窗口密钥回滚防护、纠错语义边界扩展（极性/异体数字）、中文复述与回译比例硬门禁、中文数字数值核对、审阅门禁（纠错/歧义/数量提示阻断自动同步）、SW 异步边界租约再校验、还原后长度上限、Responses/Chat 解析严格化（completed/assistant/finish_reason 白名单、对象标记校验、去除 legacy text 回退）、/models 结构校验、密钥样式请求头扩展拦截、诊断路径默认脱敏、附件兄弟节点 aria 检测、可写性命令前再校验、编辑器周期性重排名、Markdown 变长围栏与多反引号行内代码、路径分隔符扩展、保护词去重后限额与重叠匹配。
 
-The complete source-tree command was:
+## 注意
 
-```bash
-npm run verify:full
-```
-
-The same command was run from the clean release directory and from a fresh extraction of the final ZIP.
-
-## Coverage
-
-The Node-instrumented modules reached:
-
-- Lines: **85.05%**
-- Branches: **74.60%**
-- Functions: **83.86%**
-
-These percentages do not instrument `panel.js` and `writer.js` in their real browser environment. Their high-risk paths are exercised by four separate Chromium harnesses instead.
-
-## v0.2.2 paths covered automatically
-
-The automated suites cover, among other paths:
-
-- a single Provider request returning both `english` and `back_translation`;
-- independent and disabled back-translation modes;
-- short-Chinese language validation and non-Chinese back-translation rejection;
-- one controlled repair/retry path without open-ended loops;
-- independent back-translation receiving only English user content;
-- English and back-translation placeholder integrity as separate hard gates;
-- user text that merely resembles a plugin placeholder;
-- fenced JSON, gateway metadata and bounded malformed-JSON scanning;
-- duplicate, overlapping and unsafe typo claims plus forced literal retry;
-- exact Provider/Key destination binding and credential-generation checks;
-- refusal of a new-generation Key to an old or mismatched Provider snapshot;
-- transactional Provider/settings/Secret rollback across local/session storage;
-- behavior-only settings saves that do not rewrite Provider state;
-- external Provider/Key storage changes that invalidate and pause a stale panel;
-- current-panel configuration saves that do not falsely trigger the external-change guard;
-- case-insensitive custom Header de-duplication and sensitive Header removal;
-- bounded sequential fallback for unsupported `response_format` and `temperature`;
-- model-not-found versus endpoint-not-found HTTP 404 classification;
-- truncated, filtered, tool-call, function-call, structured-refusal and non-text response rejection;
-- request, response, model-list and stored-state resource limits;
-- window-scoped draft/history/diagnostic storage and legacy migration;
-- Writer lease transfer, not-ready recovery and stale-bind rejection;
-- `history.pushState()` session invalidation before stateful Writer commands;
-- expired command rejection, Target Epoch and Writer Session checks;
-- textarea, ordinary contenteditable and `contenteditable="plaintext-only"` discovery/write paths;
-- multiline editor serialization and meaningful blank-line preservation;
-- transactional restore and fail-closed recovery;
-- attachment, media and atomic-rich-content protection;
-- manual-edit detection and explicit confirmed overwrite;
-- trusted send, plain-Enter line break and external-clear classification;
-- monitored asynchronous draft/history persistence failures;
-- preservation of active drafts up to 250,000 characters while keeping the translation limit at 50,000.
-
-## Static audit boundary
-
-The audit verifies:
-
-- Manifest, package and runtime version agreement;
-- only the intended required and optional permissions;
-- no `debugger`, Cookie, history, proxy, webRequest, clipboard-read or broad required host permission;
-- strict extension CSP with no `unsafe-inline` or `unsafe-eval`;
-- no remote JavaScript;
-- no `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`, `eval` or `Function` constructor;
-- `writer.js` contains no storage access, fetch/XHR/WebSocket/beacon, Cookie, localStorage or sessionStorage access;
-- secure storage access-level initialization is present;
-- runtime Secret access is Provider-bound and unbound Secret APIs are not exported;
-- Provider identity, credential generation, cross-window invalidation, bounded compatibility fallback, route/session synchronization, attachment protection, window scoping, transactional configuration and tool/refusal rejection invariants are present.
-
-## Chromium package validation
-
-Chromium successfully produced a disposable test CRX from the clean release tree. The temporary signing key and CRX were deleted and are not included in the user ZIP. Headless Chromium can emit container-specific system warnings, but the pack operation produced both expected artifacts and exited successfully.
-
-## Release-content checks
-
-The ZIP excludes:
-
-- `.git`;
-- `__pycache__` and `.pyc`;
-- CRX/PEM signing artifacts;
-- operating-system metadata files.
-
-A scan for common OpenAI/xAI key shapes and private-key blocks found no embedded credential. The final ZIP was tested with `unzip -t`, extracted into a new directory, and subjected again to the full verification command.
-
-## Validation boundary
-
-The package has **not** been tested inside an authenticated Claude account in this environment. The first real installation must run the built-in **页面诊断** and manually verify that visible composer text equals the message actually sent.
-
-Claude can change its editor implementation at any time. Until that GO/NO-GO check passes for the current frontend, use the English preview/copy fallback for important text. The extension intentionally does not read sent Claude messages, so this final comparison cannot be automated without expanding the privacy boundary.
-
-The default same-request back-translation is a **model self-check**, not an independent semantic proof, because the same model sees the original Chinese. Important instructions can use the optional independent mode, in which the second request receives only the English text.
+- 涉及 claude.ai 真实 DOM 的发送确认行为，仍需按 README「首次页面验证」在真实账户复验。
+- 发布打包目录应与既有侧载目录一致，避免 Edge 识别为新扩展。

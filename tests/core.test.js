@@ -6,6 +6,7 @@ import {
   chatCompletion,
   endpointUrl,
   filterLikelyTextModels,
+  listModels,
   normalizeBaseUrl,
   permissionPatternForBaseUrl,
   readLimitedText,
@@ -19,12 +20,18 @@ import {
 import {
   buildBackTranslationWarnings,
   buildSoftWarnings,
+  parseChineseNumeralRun,
   parseTranslationJson,
   validateBackTranslationText,
   validateEnglishTranslationText,
   validateTranslationPayload
 } from "../lib/validation.js";
-import { backTranslate, translateDraft } from "../lib/translator.js";
+import {
+  backTranslate,
+  buildPreviewDisplayText,
+  createEnglishStreamExtractor,
+  translateDraft
+} from "../lib/translator.js";
 import {
   getSecretForProvider,
   loadDraftState,
@@ -1224,7 +1231,7 @@ test("normalizes malformed stored settings and provider data before runtime use"
   assert.equal(provider.keyStorage, "local");
   assert.equal([...provider.modelTranslate].length, 240);
   assert.deepEqual(provider.extraHeaders, {});
-  assert.deepEqual(provider.capabilities, { jsonMode: null, temperature: false });
+  assert.deepEqual(provider.capabilities, { jsonMode: null, temperature: false, streaming: null });
 
   const providerWithDangerousKeys = normalizeStoredProvider({
     authHeader: "Content-Type",
@@ -1977,4 +1984,409 @@ test("normalizes the stored api protocol and strips a pasted /responses suffix",
     normalizeBaseUrl("https://api.openai.com/v1/responses"),
     "https://api.openai.com/v1"
   );
+});
+
+test("rejects polarity flips and alternate-numeral corrections", () => {
+  for (const [source, original, interpreted_as] of [
+    ["确认是这个文件", "是", "否"],
+    ["把开状态记录下来", "开", "关"],
+    ["数量偏多一些", "偏多", "偏少"],
+    ["用壹份副本", "壹", "贰"],
+    ["共廿件", "廿", "卅"]
+  ]) {
+    const result = validateTranslationPayload({
+      english: "test",
+      corrections: [{ original, interpreted_as, reason: "model claim" }],
+      ambiguous: []
+    }, source);
+    assert.ok(result.errors.some((item) => item.includes("笔误")), `${original}→${interpreted_as} should be rejected`);
+  }
+});
+
+test("treats mostly-untranslated Chinese as a hard failure", () => {
+  const echo = validateEnglishTranslationText("你好世界", "你好世界 a", []);
+  assert.ok(echo.errors.some((item) => item.includes("复述")), echo);
+  const partial = validateEnglishTranslationText("请检查 API 状态", "请检查 API", []);
+  assert.ok(partial.errors.length > 0, partial);
+  const clean = validateEnglishTranslationText("请检查代码", "Please review the code.", []);
+  assert.deepEqual(clean.errors, []);
+});
+
+test("parses Chinese numerals and warns when translated values diverge", () => {
+  assert.equal(parseChineseNumeralRun("三十"), 30);
+  assert.equal(parseChineseNumeralRun("一千二百"), 1200);
+  assert.equal(parseChineseNumeralRun("五万"), 50000);
+  assert.equal(parseChineseNumeralRun("十三"), 13);
+  assert.equal(parseChineseNumeralRun("第三"), null);
+  const mismatch = buildSoftWarnings("部署三十台服务器", "Deploy fifty servers.");
+  assert.ok(mismatch.some((item) => item.includes("中文数字")), mismatch);
+  const match = buildSoftWarnings("部署三十台服务器", "Deploy 30 servers.");
+  assert.equal(match.some((item) => item.includes("中文数字")), false, match);
+  const ordinaryWords = buildSoftWarnings("我们一起把一样的一定做完", "Let us finish the same thing together.");
+  assert.equal(ordinaryWords.some((item) => item.includes("中文数字")), false, ordinaryWords);
+});
+
+test("rejects token-level back-translations and bidi control characters", () => {
+  const tiny = validateBackTranslationText(
+    "请检查这段代码的整体结构是否合理",
+    "Please review the structure.",
+    "x中"
+  );
+  assert.ok(tiny.errors.some((item) => item.includes("比例过低")), tiny);
+  const bidi = validateTranslationPayload({
+    english: "Delete ‮report.txt‬ now.",
+    corrections: [],
+    ambiguous: []
+  }, "现在删除文件");
+  assert.ok(bidi.errors.some((item) => item.includes("控制字符")), bidi);
+});
+
+test("over-limit correction lists fail and over-limit ambiguities warn", () => {
+  const overflow = validateTranslationPayload({
+    english: "test",
+    corrections: Array.from({ length: 9 }, (_, index) => ({
+      original: `错字${index}`, interpreted_as: `正字${index}`, reason: "claim"
+    })),
+    ambiguous: []
+  }, "一段没有这些片段的原稿");
+  assert.ok(overflow.errors.some((item) => item.includes("笔误")), overflow);
+  const manyAmbiguities = validateTranslationPayload({
+    english: "A perfectly ordinary translation.",
+    corrections: [],
+    ambiguous: Array.from({ length: 7 }, (_, index) => ({
+      fragment: "原稿", reading_used: `读法${index}`, alternatives: []
+    }))
+  }, "原稿");
+  assert.ok(manyAmbiguities.warnings.some((item) => item.includes("显示上限")), manyAmbiguities);
+});
+
+test("responses parsing accepts only completed assistant output", async () => {
+  const originalFetch = globalThis.fetch;
+  const config = {
+    baseUrl: "https://provider.example/v1",
+    apiProtocol: "responses",
+    timeoutMs: 1000,
+    capabilities: { jsonMode: false, temperature: false }
+  };
+  const attempt = () => chatCompletion({
+    config, apiKey: "k", model: "m",
+    messages: [{ role: "user", content: "你好" }],
+    preferJson: false
+  });
+  const respond = (payload) => new Response(JSON.stringify(payload), {
+    status: 200, headers: { "Content-Type": "application/json" }
+  });
+  const goodMessage = { type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "ok" }] };
+
+  try {
+    globalThis.fetch = async () => respond({ object: "response", status: "in_progress", output: [goodMessage] });
+    await assert.rejects(attempt, (error) => error?.code === "incomplete_response");
+
+    globalThis.fetch = async () => respond({ object: "response", status: "completed", output: [{ ...goodMessage, status: "in_progress" }] });
+    await assert.rejects(attempt, (error) => error?.code === "incomplete_response");
+
+    globalThis.fetch = async () => respond({ object: "response", status: "completed", output: [{ ...goodMessage, role: "user" }] });
+    await assert.rejects(attempt, (error) => error?.code === "incomplete_response");
+
+    globalThis.fetch = async () => respond({ object: "not-a-response", output: [goodMessage] });
+    await assert.rejects(attempt, (error) => error?.code === "unsupported_response_schema");
+
+    globalThis.fetch = async () => respond({ object: "response", status: "completed", output: [goodMessage] });
+    const result = await attempt();
+    assert.equal(result.text, "ok");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("chat parsing allowlists finish reasons and drops the legacy text fallback", async () => {
+  const originalFetch = globalThis.fetch;
+  const config = {
+    baseUrl: "https://provider.example/v1",
+    timeoutMs: 1000,
+    capabilities: { jsonMode: false, temperature: false }
+  };
+  const attempt = () => chatCompletion({
+    config, apiKey: "k", model: "m",
+    messages: [{ role: "user", content: "你好" }],
+    preferJson: false
+  });
+  const respond = (payload) => new Response(JSON.stringify(payload), {
+    status: 200, headers: { "Content-Type": "application/json" }
+  });
+
+  try {
+    globalThis.fetch = async () => respond({
+      choices: [{ finish_reason: "mystery_reason", message: { role: "assistant", content: "hello" } }]
+    });
+    await assert.rejects(attempt, (error) => error?.code === "incomplete_response");
+
+    globalThis.fetch = async () => respond({
+      choices: [{ finish_reason: "stop", message: { role: "user", content: "hello" } }]
+    });
+    await assert.rejects(attempt, (error) => error?.code === "incomplete_response");
+
+    globalThis.fetch = async () => respond({
+      choices: [{ finish_reason: "stop", text: "legacy completions text" }]
+    });
+    await assert.rejects(attempt, (error) => error?.code === "empty_assistant_content");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("model list requires a recognized envelope and unrelated text params do not degrade JSON mode", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => new Response(JSON.stringify({ login: "required" }), {
+      status: 200, headers: { "Content-Type": "application/json" }
+    });
+    await assert.rejects(
+      () => listModels({
+        config: { baseUrl: "https://provider.example/v1", timeoutMs: 1000 },
+        apiKey: "k"
+      }),
+      (error) => error?.code === "unsupported_response_schema"
+    );
+
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ error: { message: "text is invalid here", param: "text" } }), {
+        status: 400, headers: { "Content-Type": "application/json" }
+      });
+    };
+    await assert.rejects(() => chatCompletion({
+      config: { baseUrl: "https://provider.example/v1", timeoutMs: 1000, capabilities: { jsonMode: null, temperature: null } },
+      apiKey: "k", model: "m",
+      messages: [{ role: "user", content: "你好" }],
+      preferJson: true
+    }));
+    assert.equal(calls, 1, "an unrelated param 'text' must not trigger a paid degradation retry");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("secret-like extra headers are stripped while routing headers survive", () => {
+  const sanitized = sanitizeExtraHeaders({
+    "X-Access-Key": "a", "X-Subscription-Key": "b", "X-Credential": "c",
+    "X-Auth": "d", "X-Signature": "e", "X-Session-Id": "f",
+    "X-Project": "keepme", "X-Api-Version": "2024", "X-Request-Source": "panel"
+  });
+  assert.deepEqual(Object.keys(sanitized).sort(), ["X-Api-Version", "X-Project", "X-Request-Source"]);
+});
+
+test("variable-length fences, overlapping terms and expanded path forms are protected", () => {
+  const fenced = "````\ncode with ``` inside\nstill code\n````\n之后的中文";
+  const fencedResult = protectText(fenced, []);
+  assert.equal(fencedResult.placeholders[0].value.includes("still code"), true, fencedResult.placeholders);
+  assert.equal(fencedResult.protectedText.includes("still code"), false);
+
+  const inline = "运行 ``a`b`` 命令";
+  const inlineResult = protectText(inline, []);
+  assert.ok(inlineResult.placeholders.some((item) => item.value === "``a`b``"), inlineResult.placeholders);
+
+  const overlapping = protectText("ababa", ["aba"]);
+  assert.equal(overlapping.placeholders.length, 1);
+  assert.equal(overlapping.placeholders[0].start, 0);
+
+  const paths = protectText("路径：/tmp/file 与 path=/var/log 以及 ~/project/main.js 和 $HOME/bin/tool", []);
+  const values = paths.placeholders.map((item) => item.value);
+  assert.ok(values.includes("/tmp/file"), values);
+  assert.ok(values.includes("/var/log"), values);
+  assert.ok(values.includes("~/project/main.js"), values);
+  assert.ok(values.includes("$HOME/bin/tool"), values);
+
+  const restored = restorePlaceholders(fencedResult.protectedText, fencedResult.placeholders);
+  assert.equal(restored, fenced);
+});
+
+test("protected terms deduplicate before the cap is applied", () => {
+  const noisy = [
+    ...Array.from({ length: 500 }, () => "  重复词  "),
+    "尾部真词"
+  ];
+  const result = protectText("原稿包含 尾部真词 和 重复词", noisy);
+  const values = result.placeholders.map((item) => item.value);
+  assert.ok(values.includes("尾部真词"), values);
+  assert.ok(values.includes("重复词"), values);
+});
+
+function sseResponse(frames, { status = 200 } = {}) {
+  const encoder = new TextEncoder();
+  return new Response(new ReadableStream({
+    start(controller) {
+      for (const frame of frames) controller.enqueue(encoder.encode(frame));
+      controller.close();
+    }
+  }), { status, headers: { "Content-Type": "text/event-stream" } });
+}
+
+test("streams chat completions over SSE and reassembles the strict payload", async () => {
+  const originalFetch = globalThis.fetch;
+  const deltas = [];
+  globalThis.fetch = async (_url, options) => {
+    const body = JSON.parse(options.body);
+    assert.equal(body.stream, true);
+    return sseResponse([
+      'data: {"model":"m","choices":[{"delta":{"role":"assistant","content":"{\\"english\\":\\"Hel"}}]}\n\n',
+      'data: {"choices":[{"delta":{"content":"lo\\"}"}}]}\n\ndata: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+      "data: [DONE]\n\n"
+    ]);
+  };
+  try {
+    const result = await chatCompletion({
+      config: { baseUrl: "https://provider.example/v1", timeoutMs: 1000, capabilities: { jsonMode: false, temperature: false, streaming: null } },
+      apiKey: "k",
+      model: "m",
+      messages: [{ role: "user", content: "你好" }],
+      preferJson: false,
+      onTextDelta: (delta) => deltas.push(delta)
+    });
+    assert.equal(result.text, "{\"english\":\"Hello\"}");
+    assert.equal(deltas.join(""), "{\"english\":\"Hello\"}");
+    assert.equal(result.capabilityPatch.streaming, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("streams responses-protocol SSE and validates the final completed object", async () => {
+  const originalFetch = globalThis.fetch;
+  const deltas = [];
+  const finalResponse = {
+    object: "response",
+    status: "completed",
+    model: "m",
+    output: [{
+      type: "message", role: "assistant", status: "completed",
+      content: [{ type: "output_text", text: "streamed ok" }]
+    }]
+  };
+  globalThis.fetch = async () => sseResponse([
+    'data: {"type":"response.output_text.delta","delta":"streamed "}\n\n',
+    'data: {"type":"response.output_text.delta","delta":"ok"}\n\n',
+    `data: ${JSON.stringify({ type: "response.completed", response: finalResponse })}\n\n`
+  ]);
+  try {
+    const result = await chatCompletion({
+      config: { baseUrl: "https://provider.example/v1", apiProtocol: "responses", timeoutMs: 1000, capabilities: { jsonMode: false, temperature: false, streaming: null } },
+      apiKey: "k",
+      model: "m",
+      messages: [{ role: "user", content: "你好" }],
+      preferJson: false,
+      onTextDelta: (delta) => deltas.push(delta)
+    });
+    assert.equal(result.text, "streamed ok");
+    assert.deepEqual(deltas, ["streamed ", "ok"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("falls back transparently when a gateway ignores stream and degrades when it rejects stream", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    // Gateway ignores stream:true and answers with buffered JSON.
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      choices: [{ finish_reason: "stop", message: { role: "assistant", content: "buffered" } }]
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+    const deltas = [];
+    const buffered = await chatCompletion({
+      config: { baseUrl: "https://provider.example/v1", timeoutMs: 1000, capabilities: { jsonMode: false, temperature: false, streaming: null } },
+      apiKey: "k", model: "m",
+      messages: [{ role: "user", content: "你好" }],
+      preferJson: false,
+      onTextDelta: (delta) => deltas.push(delta)
+    });
+    assert.equal(buffered.text, "buffered");
+    assert.deepEqual(deltas, []);
+
+    // Gateway rejects the stream parameter → one retry without streaming.
+    const requests = [];
+    globalThis.fetch = async (_url, options) => {
+      requests.push(JSON.parse(options.body));
+      if (requests.length === 1) {
+        return new Response(JSON.stringify({
+          error: { message: "Unsupported parameter: stream", param: "stream" }
+        }), { status: 400, headers: { "Content-Type": "application/json" } });
+      }
+      return new Response(JSON.stringify({
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "no stream" } }]
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    };
+    const degraded = await chatCompletion({
+      config: { baseUrl: "https://provider.example/v1", timeoutMs: 1000, capabilities: { jsonMode: null, temperature: null, streaming: null } },
+      apiKey: "k", model: "m",
+      messages: [{ role: "user", content: "你好" }],
+      preferJson: true,
+      onTextDelta: () => {}
+    });
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0].stream, true);
+    assert.equal(requests[1].stream, false);
+    assert.deepEqual(requests[1].response_format, { type: "json_object" }, "JSON mode must survive a stream-only rejection");
+    assert.equal(degraded.capabilityPatch.streaming, false);
+    assert.equal(degraded.capabilityPatch.jsonMode, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("english stream extractor decodes escapes across chunk boundaries and hides partial tokens", () => {
+  const seen = [];
+  const extractor = createEnglishStreamExtractor((english) => seen.push(english));
+  extractor.push('{"eng');
+  extractor.push('lish": "Line\\');
+  extractor.push('nTwo \\u');
+  extractor.push('4F60 and \\"quoted\\""');
+  extractor.push(', "corrections": []}');
+  assert.equal(seen.at(-1), 'Line\nTwo 你 and "quoted"');
+
+  const protection = protectText("运行 `npm test` 后检查", []);
+  const token = protection.placeholders[0].token;
+  const partial = token.slice(0, token.length - 2);
+  assert.equal(
+    buildPreviewDisplayText(`Run ${partial}`, protection.placeholders),
+    "Run "
+  );
+  assert.equal(
+    buildPreviewDisplayText(`Run ${token} then check`, protection.placeholders),
+    "Run `npm test` then check"
+  );
+});
+
+test("translateDraft streams the english preview while returning fully validated output", async () => {
+  const originalFetch = globalThis.fetch;
+  const previews = [];
+  const payloadText = JSON.stringify({
+    english: "Please review the code.",
+    back_translation: "请检查这段代码。",
+    corrections: [],
+    ambiguous: []
+  });
+  const escaped = JSON.stringify(payloadText).slice(1, -1);
+  const half = Math.floor(escaped.length / 2);
+  globalThis.fetch = async () => sseResponse([
+    `data: {"choices":[{"delta":{"role":"assistant","content":"${escaped.slice(0, half)}"}}]}\n\n`,
+    `data: {"choices":[{"delta":{"content":"${escaped.slice(half)}"}}]}\n\n`,
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+    "data: [DONE]\n\n"
+  ]);
+  try {
+    const result = await translateDraft({
+      source: "请检查这段代码。",
+      config: { baseUrl: "https://provider.example/v1", timeoutMs: 1000, capabilities: { jsonMode: true, temperature: false, streaming: null } },
+      apiKey: "k",
+      model: "m",
+      onEnglishPreview: (text) => previews.push(text)
+    });
+    assert.equal(result.english, "Please review the code.");
+    assert.ok(previews.length >= 1, previews);
+    assert.equal(previews.at(-1), "Please review the code.");
+    assert.ok(previews.every((text, index) => index === 0 || text.startsWith(previews[index - 1])));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
