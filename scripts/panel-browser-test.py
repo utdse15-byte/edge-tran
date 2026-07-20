@@ -25,7 +25,6 @@ MOCK_EXTENSION = r"""
     requestTimeoutMs: 5000,
     writeIdleGuardMs: 80,
     allowFocusWrite: false,
-    clearStaleTarget: true,
     protectedTerms: []
   };
   const initialProvider = {
@@ -100,7 +99,8 @@ MOCK_EXTENSION = r"""
     nextWriteMode: 'normal',
     nextClearMode: 'normal',
     writes: [],
-    clears: []
+    clears: [],
+    forcedClears: []
   };
 
   function emit(message) {
@@ -183,6 +183,26 @@ MOCK_EXTENSION = r"""
           readback: writer.text, strategy: 'mock-native', focusUsed: false
         });
         queueMicrotask(() => emit(writerState('plugin_write')));
+        return;
+      }
+      if (message.type === 'CLEAR_TARGET_FORCE') {
+        writer.forcedClears.push(structuredClone(message));
+        if (message.expectedWriterSession !== writer.session || message.expectedTargetEpoch !== writer.epoch) {
+          respond({
+            type: 'CLEAR_TARGET_FORCE_RESULT', requestId: message.requestId, ok: false,
+            code: 'target_epoch_changed', writerSession: writer.session, targetEpoch: writer.epoch
+          });
+          return;
+        }
+        writer.text = '';
+        writer.pluginOwned = false;
+        writer.epoch += 1;
+        respond({
+          type: 'CLEAR_TARGET_FORCE_RESULT', requestId: message.requestId, ok: true,
+          writerSession: writer.session, targetEpoch: writer.epoch,
+          strategy: 'mock-native', focusUsed: false
+        });
+        queueMicrotask(() => emit(writerState('user_forced_clear')));
         return;
       }
       if (message.type === 'CLEAR_TARGET_IF_OWNED') {
@@ -389,15 +409,16 @@ def main() -> None:
         assert "已同步" in page.locator("#statusBar").inner_text()
         assert page.evaluate("window.__mock.writer.epoch") == 1
 
-        # Regression: the stale clear advances epoch while the Provider request
-        # is pending. The fresh write must take a new epoch snapshot afterwards.
+        # v0.2.12: editing the Chinese must NOT auto-delete the old English —
+        # the new translation simply replaces the plugin-owned text in place.
         page.locator("#sourceText").fill("第二版。")
-        page.wait_for_function("window.__mock.writer.clears.length >= 1", timeout=10000)
         page.wait_for_function("document.querySelector('#englishText').value === 'Second version.'", timeout=10000)
         page.wait_for_function("window.__mock.writer.text === 'Second version.'", timeout=10000)
+        assert page.evaluate("window.__mock.writer.clears.length") == 0, \
+            "no automatic clear may ever run"
         writes = page.evaluate("window.__mock.writer.writes")
-        assert writes[-1]["expectedTargetEpoch"] == 2, writes
-        assert page.evaluate("window.__mock.writer.epoch") == 3
+        assert writes[-1]["expectedTargetEpoch"] == 1, writes
+        assert page.evaluate("window.__mock.writer.epoch") == 2
         assert "已同步" in page.locator("#statusBar").inner_text()
         assert page.evaluate("window.__mock.backCalls") == 0
 
@@ -734,6 +755,54 @@ def main() -> None:
             "typing must not lift a user (Esc) pause"
         assert stability_page.evaluate("window.__mock.translationCalls") == calls_esc, \
             "no auto-translation while user-paused"
+
+        # v0.2.12 zero-delete: (6) foreign text in the composer is adopted
+        # QUIETLY (no banner, no pause), nothing is ever auto-deleted, and the
+        # explicit 清空输入框 button is the only path that removes it.
+        stability_page.locator("#pauseButton").click()
+        stability_page.wait_for_function(
+            "window.__mock.writer.text === 'First version.'", timeout=10000
+        )
+        stability_page.evaluate("""
+          window.__mock.writer.text = 'my own notes';
+          window.__mock.writer.pluginOwned = false;
+          window.__mock.writer.epoch += 1;
+          window.__mock.emit({
+            type: 'WRITER_STATE', tabId: window.__mock.writer.tabId,
+            writerSession: window.__mock.writer.session, reason: 'reconcile',
+            state: {
+              composerReady: true, currentText: window.__mock.writer.text,
+              targetEpoch: window.__mock.writer.epoch,
+              pluginOwned: false, strategy: 'mock-native'
+            }
+          });
+        """)
+        stability_page.wait_for_function(
+            "document.querySelector('#statusBar').textContent.includes('已有内容')", timeout=10000
+        )
+        assert "hidden" in (stability_page.locator("#manualBanner").get_attribute("class") or "").split(), \
+            "pre-existing user content must not raise the conflict banner"
+        assert stability_page.locator("#pauseButton").inner_text() == "暂停", \
+            "pre-existing user content must not pause automation"
+
+        stability_page.locator("#sourceText").fill("第三版。")
+        stability_page.wait_for_function(
+            "document.querySelector('#statusBar').textContent.includes('未写入')", timeout=10000
+        )
+        assert stability_page.evaluate("window.__mock.writer.text") == "my own notes", \
+            "auto-sync must never delete user content"
+        assert stability_page.evaluate("window.__mock.writer.forcedClears.length") == 0
+
+        stability_page.locator("#clearTargetButton").click()
+        stability_page.wait_for_function("window.__mock.writer.text === ''", timeout=10000)
+        assert stability_page.evaluate("window.__mock.writer.forcedClears.length") == 1
+        stability_page.wait_for_function(
+            "document.querySelector('#statusBar').textContent.includes('清空')", timeout=10000
+        )
+        stability_page.locator("#syncButton").click()
+        stability_page.wait_for_function(
+            "window.__mock.writer.text === 'Third version.'", timeout=10000
+        )
 
         assert stability_errors == [], stability_errors
         stability_page.close()

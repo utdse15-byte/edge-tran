@@ -1,6 +1,6 @@
 # Build Report
 
-- Version: **0.2.11**
+- Version: **0.2.12**
 - Date: 2026-07-20
 - Baseline: `npm run verify:full` 全部通过
   - Node 测试（`node --test tests/*.test.js`）
@@ -17,6 +17,7 @@
 - 0.2.9：思考强度兼容层 v1——方言编码器（OpenAI Chat/Responses、OpenRouter、DeepSeek、thinking_type、enable_thinking）、别名先剥离后构造、严格拒绝语义（reasoning_rejected 不重试）、映射预览与 reasoning_tokens 证据、凭据绑定不受思考配置影响。
 - 0.2.10：体验收敛——主按钮如实文案、三态自动化（含旧配置迁移）、单向 Esc、人工修改保护默认、双上限计数器、回译请求次数标注、:focus-visible 可达性。
 - 0.2.11：摩擦清除与可诊断化——系统性暂停自愈（pauseKind 四分类）、外部配置采纳并继续、评审门默认非拦截（可选严格评审）、HTTP 错误网关证据（脱敏正文摘录/request-id/协议+流式标记）、连通测试传输镜像与失败自动定位（缓冲/协议对照）。
+- 0.2.12：零删除与定位稳定——移除旧译文自动清理（含中途换稿闪空）、已有内容安静保护态、CLEAR_TARGET_FORCE 显式清空按钮（附件仍受保护）、居中主输入框形状识别修复切页定位、visibilitychange/focus/状态询问重扫触发。
 
 ## 注意
 

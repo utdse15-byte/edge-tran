@@ -215,13 +215,32 @@
     const bottomComposerShape = rect.width >= 220
       && rect.top > innerHeight * 0.32
       && rect.bottom > innerHeight * 0.62;
+    // claude.ai's home / new-chat route centers the composer in the middle of
+    // the viewport. During hydration its hint attributes can be missing and
+    // the send button stays hidden until text exists, so a bottom-only shape
+    // gate made this composer permanently unlocatable after switching pages.
+    // Kept fail-closed elsewhere: inline message-edit editors live inside
+    // conversation turns, artifact/code editors (CodeMirror, side panes) are
+    // excluded structurally, and the hero must be HORIZONTALLY centered —
+    // a right-pane document editor is wide and mid-height but never centered.
+    const centerX = rect.left + rect.width / 2;
+    const centeredComposerShape = rect.width >= 220
+      && rect.height >= 24
+      && rect.top > innerHeight * 0.12
+      && rect.top < innerHeight * 0.62
+      && Math.abs(centerX - innerWidth / 2) < innerWidth * 0.18
+      && !element.closest(
+        'article, [data-testid*="conversation-turn" i], .cm-editor, '
+        + '[data-testid*="artifact" i], [class*="artifact" i], aside, [role="complementary"]'
+      );
 
     // Fail closed for generic page editors. Strong editor semantics are only
-    // sufficient on a wide, lower-page composer-shaped surface.
+    // sufficient on a wide, composer-shaped surface (bottom bar or the
+    // centered new-chat hero).
     if (
       !hasMessageHint
       && !hasSendControl
-      && !(hasStrongEditor && bottomComposerShape)
+      && !(hasStrongEditor && (bottomComposerShape || centeredComposerShape))
     ) {
       return Number.NEGATIVE_INFINITY;
     }
@@ -233,6 +252,7 @@
     if (element.getAttribute("role") === "textbox") score += 20;
     if (hasStrongEditor) score += 45;
     if (bottomComposerShape) score += 15;
+    if (hasStrongEditor && centeredComposerShape) score += 15;
     if (rect.top > innerHeight * 0.45) score += 35;
     if (rect.bottom > innerHeight * 0.75) score += 25;
     if (rect.width > 320) score += 20;
@@ -243,7 +263,14 @@
     if (element.closest('article, [data-testid*="conversation-turn" i]')) {
       score -= 90;
     }
-    if (rect.bottom < innerHeight * 0.55 && !hasMessageHint) score -= 90;
+    // The upper-page penalty exists to reject stray editors far from any
+    // composer shape; a strong centered hero composer is exactly the shape it
+    // must not reject.
+    if (
+      rect.bottom < innerHeight * 0.55
+      && !hasMessageHint
+      && !(hasStrongEditor && centeredComposerShape)
+    ) score -= 90;
     return score;
   }
 
@@ -903,6 +930,10 @@
     rebindTimer = setTimeout(ensureComposer, REBIND_DELAY_MS);
   }
 
+  function handleVisibilityRescan() {
+    if (document.visibilityState === "visible") scheduleEnsureComposer();
+  }
+
   function nodeContainsComposer(node) {
     return Boolean(
       composer
@@ -978,6 +1009,11 @@
     window.addEventListener("popstate", scheduleEnsureComposer);
     window.addEventListener("hashchange", scheduleEnsureComposer);
     window.addEventListener("pageshow", scheduleEnsureComposer);
+    // Background tabs throttle the periodic rescan to ~1/min; without these,
+    // returning to a tab whose composer changed while hidden can leave it
+    // unlocated noticeably long.
+    document.addEventListener("visibilitychange", handleVisibilityRescan);
+    window.addEventListener("focus", scheduleEnsureComposer);
     rootObserver = new MutationObserver(handleRootMutations);
     if (document.body) {
       rootObserver.observe(document.body, { childList: true, subtree: true });
@@ -1017,6 +1053,8 @@
     window.removeEventListener("popstate", scheduleEnsureComposer);
     window.removeEventListener("hashchange", scheduleEnsureComposer);
     window.removeEventListener("pageshow", scheduleEnsureComposer);
+    document.removeEventListener("visibilitychange", handleVisibilityRescan);
+    window.removeEventListener("focus", scheduleEnsureComposer);
     rootObserver?.disconnect();
     rootObserver = null;
     if (rebindTimer !== null) clearTimeout(rebindTimer);
@@ -1575,7 +1613,23 @@
   }
 
   async function handleClearIfOwned(message) {
-    const resultType = "CLEAR_TARGET_IF_OWNED_RESULT";
+    return handleClearTarget(message, {
+      resultType: "CLEAR_TARGET_IF_OWNED_RESULT",
+      enforceOwnership: true
+    });
+  }
+
+  // Explicit user-button variant: the ONLY path allowed to remove content the
+  // plugin did not write. Every other guard (state validation, visibility,
+  // protected nodes, interruption rollback, readback) applies unchanged.
+  async function handleClearForce(message) {
+    return handleClearTarget(message, {
+      resultType: "CLEAR_TARGET_FORCE_RESULT",
+      enforceOwnership: false
+    });
+  }
+
+  async function handleClearTarget(message, { resultType, enforceOwnership }) {
     if (!validateExpectedState(message, resultType, "清理")) return;
     if (document.visibilityState === "hidden") {
       return rejectResult(resultType, message.requestId, "target_inactive", "目标 Claude 标签页不在前台，未执行清理");
@@ -1594,7 +1648,7 @@
         "Claude 输入框中含有附件、图片或不可安全替换的富文本节点；未执行自动清理"
       );
     }
-    if (!pluginOwned || current !== normalizeText(lastWritten)) {
+    if (enforceOwnership && (!pluginOwned || current !== normalizeText(lastWritten))) {
       return rejectResult(resultType, message.requestId, "not_plugin_owned", "当前内容不是插件的最后写入值");
     }
 
@@ -1696,7 +1750,7 @@
       strategy: clearResult.strategy,
       focusUsed: clearResult.focusUsed
     });
-    sendState("stale_target_cleared");
+    sendState(enforceOwnership ? "stale_target_cleared" : "user_forced_clear");
   }
 
   function handleGetTargetText(message) {
@@ -2042,6 +2096,9 @@
       case "CLEAR_TARGET_IF_OWNED":
         queueWriterCommand(message, handleClearIfOwned);
         break;
+      case "CLEAR_TARGET_FORCE":
+        queueWriterCommand(message, handleClearForce);
+        break;
       case "GET_TARGET_TEXT":
         queueWriterCommand(message, handleGetTargetText);
         break;
@@ -2054,6 +2111,11 @@
       case "REQUEST_WRITER_STATE":
         queueWriterCommand(message, () => {
           if (attached && location.href !== lastUrl) ensureComposer();
+          // A state request while the composer is unlocated doubles as a
+          // relocate nudge: the panel asks exactly when it suspects staleness.
+          if (attached && (!composer?.isConnected || !isEditableCandidate(composer))) {
+            scheduleEnsureComposer();
+          }
           sendState("requested");
           post({
             type: "REQUEST_WRITER_STATE_RESULT",

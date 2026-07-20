@@ -604,6 +604,187 @@ def main() -> None:
         assert not any(message.get("type") == "SEND_CONFIRMED" for message in newline_messages), newline_messages
         newline_page.close()
 
+        # v0.2.12: claude.ai's new-chat route centers a strong editor with no
+        # hint attributes and no visible send button. It must still be located.
+        hero_page = browser.new_page(viewport={"width": 1200, "height": 800})
+        hero_page.set_content(
+            "<!doctype html><body>"
+            '<div style="height:180px"></div>'
+            '<div class="ProseMirror" id="editor" contenteditable="true" '
+            'style="width:600px;height:80px;border:1px solid;margin:0 auto"></div>'
+            '<div style="height:460px"></div>'
+            "</body>"
+        )
+        hero_page.evaluate(
+            """() => {
+              const messages = [];
+              const messageListeners = [];
+              const disconnectListeners = [];
+              const port = {
+                postMessage(message) { messages.push(structuredClone(message)); },
+                onMessage: { addListener(listener) { messageListeners.push(listener); } },
+                onDisconnect: { addListener(listener) { disconnectListeners.push(listener); } },
+                disconnect() { for (const listener of disconnectListeners) listener(); }
+              };
+              window.__writerHarness = { messages, messageListeners, disconnectListeners };
+              window.chrome = { runtime: { id: 'test-extension', connect() { return port; } } };
+            }"""
+        )
+        hero_page.add_script_tag(content=WRITER_JS)
+        hero_page.wait_for_timeout(40)
+        hero_page.evaluate(
+            "message => window.__writerHarness.messageListeners[0](message)",
+            {"type": "ATTACH", "lease": "lease-hero"},
+        )
+        hero_page.wait_for_timeout(60)
+        hero_state = hero_page.evaluate(
+            "window.__writerHarness.messages.findLast(message => message.type === 'WRITER_STATE')"
+        )
+        assert hero_state and hero_state["state"]["composerReady"], \
+            ("centered hero composer must be locatable without hints", hero_state)
+        hero_session = hero_state["writerSession"]
+        hero_epoch = hero_state["state"]["targetEpoch"]
+
+        # v0.2.12 zero-delete contract at the writer level: a non-forced write
+        # refuses foreign text; CLEAR_TARGET_IF_OWNED refuses it too; only the
+        # explicit CLEAR_TARGET_FORCE removes it — and even that never touches
+        # attachments.
+        hero_page.evaluate("document.getElementById('editor').textContent = 'user note'")
+        hero_page.wait_for_timeout(150)
+        # The direct DOM edit is reported as a manual edit and advances the
+        # epoch; later commands must CAS against the advanced value.
+        hero_epoch = hero_page.evaluate(
+            """() => {
+              let epoch = 0;
+              for (const message of window.__writerHarness.messages) {
+                if (Number.isInteger(message.targetEpoch)) epoch = message.targetEpoch;
+                else if (Number.isInteger(message.state?.targetEpoch)) epoch = message.state.targetEpoch;
+              }
+              return epoch;
+            }"""
+        )
+        refused_write = send(
+            hero_page,
+            {
+                "type": "WRITE_TARGET",
+                "requestId": "hero-write-refused",
+                "lease": "lease-hero",
+                "text": "translation",
+                "expectedWriterSession": hero_session,
+                "expectedTargetEpoch": hero_epoch,
+                "allowFocus": True,
+                "deadline": 2**53 - 1,
+            },
+        )
+        assert not refused_write["ok"] and refused_write["code"] == "manual_edit", refused_write
+        assert hero_page.locator("#editor").inner_text() == "user note"
+
+        refused_clear = send(
+            hero_page,
+            {
+                "type": "CLEAR_TARGET_IF_OWNED",
+                "requestId": "hero-clear-refused",
+                "lease": "lease-hero",
+                "expectedWriterSession": hero_session,
+                "expectedTargetEpoch": hero_epoch,
+                "allowFocus": True,
+                "deadline": 2**53 - 1,
+            },
+        )
+        assert not refused_clear["ok"] and refused_clear["code"] == "not_plugin_owned", refused_clear
+        assert hero_page.locator("#editor").inner_text() == "user note"
+
+        forced_clear = send(
+            hero_page,
+            {
+                "type": "CLEAR_TARGET_FORCE",
+                "requestId": "hero-clear-forced",
+                "lease": "lease-hero",
+                "expectedWriterSession": hero_session,
+                "expectedTargetEpoch": hero_epoch,
+                "allowFocus": True,
+                "deadline": 2**53 - 1,
+            },
+            wait_ms=200,
+        )
+        assert forced_clear["ok"], forced_clear
+        assert hero_page.locator("#editor").inner_text().strip() == ""
+
+        hero_page.evaluate(
+            "document.getElementById('editor').innerHTML = "
+            "'draft <span data-attachment contenteditable=\"false\">f.png</span>'"
+        )
+        hero_page.wait_for_timeout(150)
+        # The injected attachment markup is itself a manual edit → fresh epoch.
+        hero_epoch_after_attachment = hero_page.evaluate(
+            """() => {
+              let epoch = 0;
+              for (const message of window.__writerHarness.messages) {
+                if (Number.isInteger(message.targetEpoch)) epoch = message.targetEpoch;
+                else if (Number.isInteger(message.state?.targetEpoch)) epoch = message.state.targetEpoch;
+              }
+              return epoch;
+            }"""
+        )
+        protected_clear = send(
+            hero_page,
+            {
+                "type": "CLEAR_TARGET_FORCE",
+                "requestId": "hero-clear-protected",
+                "lease": "lease-hero",
+                "expectedWriterSession": hero_session,
+                "expectedTargetEpoch": hero_epoch_after_attachment,
+                "allowFocus": True,
+                "deadline": 2**53 - 1,
+            },
+            wait_ms=200,
+        )
+        assert not protected_clear["ok"], protected_clear
+        assert protected_clear["code"] == "protected_content_present", protected_clear
+        assert "draft" in hero_page.locator("#editor").inner_text()
+        hero_page.close()
+
+        # Fail-closed counterpart: a centered CodeMirror-style artifact editor
+        # (strong textbox semantics, composer-like shape) must NOT be located.
+        artifact_page = browser.new_page(viewport={"width": 1200, "height": 800})
+        artifact_page.set_content(
+            "<!doctype html><body>"
+            '<div style="height:180px"></div>'
+            '<div class="cm-editor" style="width:600px;margin:0 auto">'
+            '<div id="editor" contenteditable="true" role="textbox" aria-multiline="true" '
+            'style="width:600px;height:80px;border:1px solid"></div></div>'
+            '<div style="height:460px"></div>'
+            "</body>"
+        )
+        artifact_page.evaluate(
+            """() => {
+              const messages = [];
+              const messageListeners = [];
+              const disconnectListeners = [];
+              const port = {
+                postMessage(message) { messages.push(structuredClone(message)); },
+                onMessage: { addListener(listener) { messageListeners.push(listener); } },
+                onDisconnect: { addListener(listener) { disconnectListeners.push(listener); } },
+                disconnect() { for (const listener of disconnectListeners) listener(); }
+              };
+              window.__writerHarness = { messages, messageListeners, disconnectListeners };
+              window.chrome = { runtime: { id: 'test-extension', connect() { return port; } } };
+            }"""
+        )
+        artifact_page.add_script_tag(content=WRITER_JS)
+        artifact_page.wait_for_timeout(40)
+        artifact_page.evaluate(
+            "message => window.__writerHarness.messageListeners[0](message)",
+            {"type": "ATTACH", "lease": "lease-artifact"},
+        )
+        artifact_page.wait_for_timeout(60)
+        artifact_state = artifact_page.evaluate(
+            "window.__writerHarness.messages.findLast(message => message.type === 'WRITER_STATE')"
+        )
+        assert artifact_state and not artifact_state["state"]["composerReady"], \
+            ("artifact/code editors must stay unlocatable", artifact_state)
+        artifact_page.close()
+
         browser.close()
 
     print("writer browser safety test: PASS")
