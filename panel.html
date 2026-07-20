@@ -33,11 +33,11 @@
     <div id="statusBar" class="status-bar" role="status" aria-live="polite">准备就绪</div>
     <div id="staleBanner" class="banner warning hidden" role="alert"></div>
     <div id="manualBanner" class="banner danger hidden" role="alert">
-      <strong>检测到你直接修改了 Claude 中的英文</strong>
-      <p>自动覆盖已暂停。选择如何处理当前人工版本。</p>
+      <strong>检测到你在 Claude 中修改了英文</strong>
+      <p>为避免覆盖你的修改，自动同步已暂停。</p>
       <div class="button-row wrap">
-        <button id="keepManualButton" class="secondary-button" type="button">保留人工英文</button>
-        <button id="regenerateButton" class="primary-button" type="button">用最新中文重译</button>
+        <button id="keepManualButton" class="primary-button" type="button">保留 Claude 当前英文</button>
+        <button id="regenerateButton" class="danger-button" type="button">重新翻译并覆盖…</button>
         <button id="baselineButton" class="secondary-button" type="button">作为核对基线</button>
       </div>
     </div>
@@ -47,20 +47,21 @@
         <div class="section-heading">
           <label for="sourceText">中文原稿</label>
           <div class="heading-actions">
-            <span id="sourceCount" class="counter">0</span>
-            <label class="switch-label" title="自动翻译并同步">
-              <input id="autoSyncToggle" type="checkbox" checked>
-              <span>自动</span>
-            </label>
+            <span id="sourceCount" class="counter" title="可翻译上限 50,000 字符；最多可暂存 250,000 字符">0 / 50,000</span>
+            <select id="automationMode" class="mode-select" title="自动化模式：手动＝不自动请求模型；自动翻译＝停顿后请求模型但不写入 Claude；自动翻译并同步＝停顿后请求并写入 Claude 输入框">
+              <option value="manual">手动</option>
+              <option value="auto_translate">自动翻译</option>
+              <option value="auto_sync">自动翻译并同步</option>
+            </select>
           </div>
         </div>
         <textarea id="sourceText" rows="8" maxlength="250000" spellcheck="false" autocomplete="off" placeholder="在这里输入中文。中文只存在于扩展侧边栏，不进入 Claude 页面；完整英文才会写入。"></textarea>
         <div class="button-row">
-          <button id="translateButton" class="primary-button" type="button">立即翻译</button>
+          <button id="translateButton" class="primary-button" type="button">翻译并同步</button>
           <button id="pauseButton" class="secondary-button" type="button">暂停</button>
           <button id="clearDraftButton" class="ghost-button" type="button">清空</button>
         </div>
-        <p id="longTextHint" class="inline-hint hidden">文本较长，已停止自动重译；点击“翻译整段”。</p>
+        <p id="longTextHint" class="inline-hint hidden">文本较长，已停止自动重译；点击“翻译整段并同步”。</p>
       </section>
 
       <section id="correctionSection" class="notice-card hidden">
@@ -102,7 +103,7 @@
 
     <footer class="app-footer">
       <button id="diagnosticsButton" class="ghost-button" type="button">页面诊断</button>
-      <span>Ctrl+Enter 立即翻译 · Esc 暂停/恢复</span>
+      <span>Ctrl+Enter 翻译并同步 · Esc 仅暂停（恢复请点按钮）</span>
     </footer>
   </div>
 
@@ -190,9 +191,9 @@
         </label>
         <label>回译方式
           <select id="backTranslationMode">
-            <option value="same_request">同一次请求同时翻译和回译（默认）</option>
-            <option value="independent">第二次独立请求回译（更可靠，成本更高）</option>
-            <option value="off">关闭回译</option>
+            <option value="same_request">同一次请求同时翻译和回译（默认 · 1 次请求）</option>
+            <option value="independent">第二次独立请求回译（更可靠 · 2 次请求）</option>
+            <option value="off">关闭回译（仅英译 · 1 次请求）</option>
           </select>
         </label>
         <p id="backTranslationModeHelp" class="settings-help">同请求模式只使用主翻译模型；模型先生成英文，再在同一响应中生成中文回译。</p>

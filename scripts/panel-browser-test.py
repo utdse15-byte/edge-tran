@@ -643,9 +643,13 @@ def main() -> None:
             "document.querySelector('#translateButton').disabled === false", timeout=10000
         )
         assert stability_page.locator("#pauseButton").inner_text() == "恢复"
-        # Resume: the aborted draft has no current English, so this schedules a
-        # fresh translation that completes and syncs.
+        # Esc is one-way now: a second press must NOT resume automation.
         stability_page.locator("#sourceText").press("Escape")
+        assert stability_page.locator("#pauseButton").inner_text() == "恢复", \
+            "Esc must never re-arm automation"
+        # Resume via the explicit button: the aborted draft has no current
+        # English, so this schedules a fresh translation that completes+syncs.
+        stability_page.locator("#pauseButton").click()
         stability_page.wait_for_function(
             "document.querySelector('#englishText').value === 'First version.'", timeout=10000
         )

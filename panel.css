@@ -195,3 +195,31 @@ fieldset > label > select { margin-top: 4px; color: var(--text); font-size: 14px
 .conditional-settings > label { display: block; margin-bottom: 9px; color: var(--muted); font-size: 12px; }
 .conditional-settings > label:last-child { margin-bottom: 0; }
 .conditional-settings input { margin-top: 4px; color: var(--text); font-size: 14px; }
+
+/* ===== 0.2.10 UX 收敛 ===== */
+
+/* 可见键盘焦点：所有交互元素 */
+button:focus-visible,
+a:focus-visible,
+[role="button"]:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
+/* 高频按钮的最小可点击高度 */
+.primary-button,
+.secondary-button,
+.danger-button {
+  min-height: 36px;
+}
+
+/* 头部三态自动化选择器 */
+.mode-select {
+  font-size: 12px;
+  padding: 2px 4px;
+  max-width: 132px;
+  border-radius: 6px;
+}
