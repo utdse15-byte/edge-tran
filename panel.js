@@ -38,6 +38,7 @@ import {
   filterLikelyTextModels,
   listModels,
   normalizeBaseUrl,
+  normalizedApiProtocol,
   permissionPatternForBaseUrl,
   ProviderError,
   sanitizeExtraHeaders
@@ -103,6 +104,7 @@ const ui = {
   providerPreset: $("#providerPreset"),
   providerName: $("#providerName"),
   baseUrl: $("#baseUrl"),
+  apiProtocol: $("#apiProtocol"),
   authHeader: $("#authHeader"),
   authPrefix: $("#authPrefix"),
   apiKey: $("#apiKey"),
@@ -191,6 +193,10 @@ const state = {
   sourceRevision: 0,
   composing: false,
   paused: false,
+  // True only when the CURRENT pause was caused by a recoverable target loss
+  // (writer port died: page reload / MV3 restart), not by the user. A
+  // successful automatic re-bind then resumes without a manual 恢复 click.
+  pausedByTargetLoss: false,
   manualText: "",
   lastInputAt: 0,
   literalFragments: new Set(),
@@ -341,7 +347,10 @@ function updateProviderSummary() {
     : mode === BACK_TRANSLATION_MODES.INDEPENDENT
       ? "独立回译"
       : "仅英译";
-  ui.providerSummary.textContent = `${state.provider.name || "Provider"} · ${model} · ${modeLabel}`;
+  const protocolLabel = normalizedApiProtocol(state.provider) === "responses"
+    ? " · Responses"
+    : "";
+  ui.providerSummary.textContent = `${state.provider.name || "Provider"} · ${model} · ${modeLabel}${protocolLabel}`;
 }
 
 function updateTargetUI() {
@@ -617,6 +626,12 @@ function abortInFlight() {
   state.backController?.abort();
   state.mainController = null;
   state.backController = null;
+  // Nulling mainController above means the aborted translateNow's finally
+  // (identity-guarded since 0.2.5) will no longer re-enable the button. With
+  // nothing in flight anymore the button must be clickable again — otherwise
+  // any abort while translating (pause, SW restart, rebind, draft clear)
+  // leaves 立即翻译 permanently disabled.
+  ui.translateButton.disabled = false;
   // An aborted independent back-translation exits through the AbortError guard
   // and therefore never reaches its normal ready/error state assignment. Reset
   // transient phases here so the UI cannot remain stuck on “回译中/等待回译”
@@ -734,7 +749,7 @@ function rememberPersistedCapabilities(provider) {
   state.persistedCapabilitySignature = null;
   state.persistedCapabilities = null;
   try {
-    state.persistedCapabilitySignature = `${normalizeBaseUrl(provider.baseUrl)}\n${provider.modelTranslate || ""}`;
+    state.persistedCapabilitySignature = `${normalizeBaseUrl(provider.baseUrl)}\n${provider.modelTranslate || ""}\n${normalizedApiProtocol(provider)}`;
     state.persistedCapabilities = clone(provider.capabilities);
   } catch {
     // A stored Base URL that predates current validation cannot anchor a
@@ -931,9 +946,11 @@ function providerErrorMessage(error) {
     case "logical_api_error":
       return "Provider 以 HTTP 200 返回了逻辑错误";
     case "responses_api_response":
-      return "Provider 返回了 Responses API 结构；当前扩展配置要求 Chat Completions";
+      return "Provider 返回了 Responses API 结构；请在设置中把“接口协议”切换为 Responses API 后重试";
+    case "chat_completions_response":
+      return "Provider 返回了 Chat Completions 结构；请在设置中把“接口协议”切换为 Chat Completions 后重试";
     case "unsupported_response_schema":
-      return "Provider 响应不是 OpenAI Chat Completions 结构";
+      return "Provider 响应结构与所选接口协议不符";
     case "empty_choices":
       return "Provider 返回了空 choices 数组";
     case "empty_assistant_content":
@@ -1154,6 +1171,14 @@ function handlePanelMessage(message) {
       state.bindRequestId = message.bindRequestId ?? state.bindRequestId;
       if (state.bindRetryTimer) clearTimeout(state.bindRetryTimer);
       state.bindRetryTimer = null;
+      if (state.pausedByTargetLoss) {
+        // The pause was only ever about the lost connection, and the target
+        // is bound again. Requiring a manual 恢复 here made every page
+        // reload / MV3 service-worker restart interrupt the workflow.
+        state.pausedByTargetLoss = false;
+        state.paused = false;
+        addDiagnostic("目标连接已自动恢复，自动翻译与同步继续");
+      }
       state.target = {
         ...state.target,
         bound: true,
@@ -1300,24 +1325,50 @@ function handlePanelMessage(message) {
       }
       break;
       }
-    case "WRITER_SESSION_CHANGED":
-      abortInFlight();
-      state.paused = true;
+    case "WRITER_SESSION_CHANGED": {
+      // Pause only when the switch actually orphans plugin content in the old
+      // conversation. With nothing synced/owned, an ordinary conversation
+      // switch used to force a manual 恢复 on every navigation — pure
+      // friction. In-flight translations are target-independent: their write
+      // step re-validates the target identity and degrades to preview-only,
+      // so aborting them here would only waste an already-billed request.
+      const orphansPluginContent = state.target.pluginOwned
+        || ["synced", "stale-uncleared", "syncing"].includes(state.targetPhase);
       state.target.writerSession = message.writerSession;
       state.target.targetEpoch = message.targetEpoch ?? 0;
       state.target.pluginOwned = false;
       state.target.composerReady = false;
       state.target.currentText = "";
-      state.targetPhase = "session-changed";
-      setStatus("Claude 会话或路由已变化，旧绑定状态作废", "paused");
+      if (orphansPluginContent) {
+        abortInFlight();
+        state.paused = true;
+        state.pausedByTargetLoss = false;
+        state.targetPhase = "session-changed";
+        setStatus("Claude 会话或路由已变化，旧绑定状态作废", "paused");
+        addDiagnostic("Claude SPA 会话变化；需要重新确认输入框状态");
+      } else {
+        state.targetPhase = state.draft.english ? "preview-only" : "empty";
+        setStatus(
+          state.draft.english
+            ? "Claude 会话已切换；英文预览保留，需要时点“同步到 Claude”"
+            : "Claude 会话已切换",
+          "idle"
+        );
+        addDiagnostic("Claude SPA 会话变化；无插件内容受影响，自动流程继续");
+      }
       hideManualBanner();
       updateTargetUI();
       updateDraftUI();
-      addDiagnostic("Claude SPA 会话变化；需要重新确认输入框状态");
       break;
+    }
     case "TARGET_UNAVAILABLE":
     case "TARGET_TAKEN":
       abortInFlight();
+      // Remember whether this pause is newly caused by a recoverable
+      // connection loss. A user-initiated pause must never auto-resume.
+      state.pausedByTargetLoss = !state.paused
+        && message.type === "TARGET_UNAVAILABLE"
+        && Boolean(message.recoverable);
       state.paused = true;
       state.target.bound = false;
       state.target.connected = false;
@@ -2406,6 +2457,9 @@ function fillSettingsForm() {
   ui.providerPreset.value = state.provider.preset || "custom";
   ui.providerName.value = state.provider.name || "";
   ui.baseUrl.value = state.provider.baseUrl || "";
+  ui.apiProtocol.value = state.provider.apiProtocol === "responses"
+    ? "responses"
+    : "chat_completions";
   ui.authHeader.value = state.provider.authHeader || "Authorization";
   ui.authPrefix.value = state.provider.authPrefix ?? "Bearer";
   ui.keyStorage.value = state.provider.keyStorage || "local";
@@ -2467,6 +2521,9 @@ function parseExtraHeadersInput() {
 
 function providerFromForm() {
   const baseUrl = normalizeBaseUrl(ui.baseUrl.value);
+  const apiProtocol = ui.apiProtocol.value === "responses"
+    ? "responses"
+    : "chat_completions";
   const modelTranslate = ui.modelTranslate.value.trim();
   const modelBackTranslate = ui.modelBackTranslate.value.trim() || modelTranslate;
   const authHeader = ui.authHeader.value.trim() || "Authorization";
@@ -2477,7 +2534,10 @@ function providerFromForm() {
   if (authHeader.length > 128 || authPrefix.length > 128) {
     throw new Error("鉴权 Header 或 Key 前缀过长");
   }
-  const signature = `${baseUrl}\n${modelTranslate}`;
+  // Learned capabilities are endpoint-behavior: the same gateway may accept
+  // response_format on /chat/completions and reject text.format on
+  // /responses, so the protocol is part of the capability identity.
+  const signature = `${baseUrl}\n${modelTranslate}\n${apiProtocol}`;
   let capabilities = clone(DEFAULT_PROVIDER.capabilities);
   // Carry over only what is actually persisted for this exact target. Reading
   // state.provider.capabilities here would leak runtime-learned degradations
@@ -2496,6 +2556,7 @@ function providerFromForm() {
     preset: ui.providerPreset.value,
     name: ui.providerName.value.trim() || "Provider",
     baseUrl,
+    apiProtocol,
     keyStorage: ui.keyStorage.value,
     authHeader,
     authPrefix,
@@ -2721,7 +2782,7 @@ async function testProviderFromForm() {
     }
 
     provider.capabilities = { ...provider.capabilities, ...capabilityPatch };
-    state.formCapabilitySignature = `${provider.baseUrl}\n${provider.modelTranslate}`;
+    state.formCapabilitySignature = `${provider.baseUrl}\n${provider.modelTranslate}\n${normalizedApiProtocol(provider)}`;
     state.formCapabilities = clone(provider.capabilities);
     const backPreview = backPreviewText
       ? ` / 回译：${backPreviewText.slice(0, 42)}`
@@ -3044,6 +3105,7 @@ function bindEvents() {
     } else if (event.key === "Escape") {
       event.preventDefault();
       state.paused = !state.paused;
+      state.pausedByTargetLoss = false;
       if (state.paused) abortInFlight();
       else scheduleTranslation();
       setStatus(state.paused ? "自动翻译与同步已暂停" : "自动翻译与同步已恢复", state.paused ? "paused" : "idle");
@@ -3055,6 +3117,7 @@ function bindEvents() {
   ui.translateButton.addEventListener("click", () => void translateNow({ forceSync: true, reason: "button" }));
   ui.pauseButton.addEventListener("click", () => {
     state.paused = !state.paused;
+    state.pausedByTargetLoss = false;
     if (state.paused) abortInFlight();
     else scheduleTranslation();
     setStatus(state.paused ? "自动翻译与同步已暂停" : "自动翻译与同步已恢复", state.paused ? "paused" : "idle");

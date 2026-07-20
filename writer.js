@@ -6,6 +6,7 @@
   const PORT_RECONNECT_DELAY_MS = 450;
   const HIDDEN_COMPOSER_GRACE_MS = 5000;
   const TEXT_CONTROL_POLL_MS = 500;
+  const COMPOSER_SCAN_INTERVAL_MS = 1000;
   const EDITABLE_SELECTOR = [
     "textarea",
     'input[type="text"]',
@@ -45,6 +46,7 @@
   let mutationQueue = Promise.resolve();
   let hiddenComposerSince = 0;
   let textControlPollTimer = null;
+  let composerScanTimer = null;
 
   function randomId(prefix) {
     const bytes = new Uint8Array(10);
@@ -968,6 +970,21 @@
     if (document.body) {
       rootObserver.observe(document.body, { childList: true, subtree: true });
     }
+    // The root observer only sees childList changes. Claude's empty-state
+    // editor can become locatable through attribute-only hydration (labels,
+    // contenteditable flips, visibility) that never adds a node — without a
+    // periodic rescan the composer stays unlocated until the user types into
+    // the page and forces a structural mutation.
+    composerScanTimer = setInterval(() => {
+      if (!attached) return;
+      if (!composer) {
+        if (locateComposer()) scheduleEnsureComposer();
+        return;
+      }
+      if (!composer.isConnected || !isEditableCandidate(composer)) {
+        scheduleEnsureComposer();
+      }
+    }, COMPOSER_SCAN_INTERVAL_MS);
     bindComposer(locateComposer(), "attached");
   }
 
@@ -989,6 +1006,8 @@
     rootObserver = null;
     if (rebindTimer !== null) clearTimeout(rebindTimer);
     rebindTimer = null;
+    if (composerScanTimer !== null) clearInterval(composerScanTimer);
+    composerScanTimer = null;
     clearManualBind();
     clearSendIntent();
     if (reason !== "reattach") {

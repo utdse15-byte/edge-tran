@@ -131,6 +131,12 @@
         <label>Base URL
           <input id="baseUrl" type="url" inputmode="url" autocomplete="off" placeholder="https://api.example.com/v1">
         </label>
+        <label>接口协议
+          <select id="apiProtocol">
+            <option value="chat_completions">Chat Completions（默认，POST {baseUrl}/chat/completions）</option>
+            <option value="responses">Responses API（POST {baseUrl}/responses）</option>
+          </select>
+        </label>
         <div class="two-columns">
           <label>鉴权 Header
             <input id="authHeader" type="text" autocomplete="off" value="Authorization">

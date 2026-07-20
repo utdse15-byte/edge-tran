@@ -2,7 +2,15 @@
 
 在 Edge 侧边栏输入中文，插件使用你自己的 OpenAI、xAI/Grok 或 OpenAI Chat Completions 兼容供应商生成英文，并把完整英文同步到 `claude.ai` 的消息输入框；中文回译用于检查语义。
 
-当前版本：**0.2.5**。
+当前版本：**0.2.6**。
+
+## 0.2.6 更新重点
+
+- 新增 **OpenAI Responses API（`/v1/responses`）支持**：在设置的"接口协议"中显式选择;插件不自动猜路由、不跨协议重试。Responses 请求默认 `store: false`,不留存服务端响应。
+- "立即翻译"按钮在暂停、换绑、清空草稿或后台重启中止翻译后不再可能永久禁用（0.2.5 引入的回归）。
+- Claude 空态输入框经属性级 hydration 出现时可自动定位,不再需要先往页面输入内容。
+- 普通换会话不再强制暂停、不再中止在途翻译;只有插件已写入的文本被孤立时才暂停。
+- 页面刷新 / 后台服务重启导致的可恢复断连,在自动重绑成功后自动恢复,不再每次要求点"恢复"。
 
 ## 0.2.5 修复重点
 
@@ -117,12 +125,15 @@ OpenAI: https://api.openai.com/v1
 xAI:    https://api.x.ai/v1
 ```
 
-自定义端点应兼容：
+自定义端点应兼容（按所选"接口协议"二选一）：
 
 ```text
 GET  {baseUrl}/models             # 可选
-POST {baseUrl}/chat/completions   # 必需
+POST {baseUrl}/chat/completions   # 接口协议 = Chat Completions（默认）
+POST {baseUrl}/responses          # 接口协议 = Responses API
 ```
+
+若供应商只提供 OpenAI Responses API（`/v1/responses`），在设置的"接口协议"里选择 Responses API。协议是显式配置：返回结构与所选协议不符时插件会明确报错并提示切换，不会自行改路由重试。Responses 请求携带 `store: false`，不在服务端留存响应内容。
 
 Base URL 必须包含供应商要求的 API 前缀。例如供应商的实际端点是
 `https://example.com/v1/chat/completions`，应填写 `https://example.com/v1`；也可粘贴完整的 `/chat/completions` 地址，保存时会规范化为 Base URL。不要只填写网站首页域名。
@@ -203,7 +214,7 @@ Claude 的富文本编辑器可能随时更新。首次安装、升级或 Claude
 
 ## 已知边界
 
-- v0.2.4 仍只实现 Chat Completions；若网关返回 Responses API 结构，会明确报告不兼容。
+- 支持 Chat Completions 与 Responses API 两种协议，但必须显式选择；返回结构与所选协议不符会明确报错，不会自动切换。Responses 模式忽略 `reasoning` 输出项，只接受纯 `output_text` 结果。
 - Provider 已开始处理的请求即使客户端 Abort，也可能仍产生费用。
 - 同请求回译是自检，不是独立语义证明。
 - 自定义兼容网关差异很大；插件只对明确的不兼容参数进行最多两步、逐项且有界的降级。

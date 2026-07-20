@@ -582,6 +582,90 @@ def main() -> None:
         assert cross_errors == [], cross_errors
         cross_page.close()
 
+        # Stability regressions: (1) an ordinary conversation switch with no
+        # plugin-owned content must not force a manual 恢复; (2) an abort while
+        # a translation is in flight must re-enable 立即翻译; (3) a recoverable
+        # target loss must auto-resume once the automatic re-bind succeeds.
+        stability_page = browser.new_page(viewport={"width": 430, "height": 900})
+        stability_errors: list[str] = []
+        stability_page.on("pageerror", lambda error: stability_errors.append(str(error)))
+        stability_page.on(
+            "console",
+            lambda message: stability_errors.append(f"console:{message.text}") if message.type == "error" else None,
+        )
+        stability_page.set_content(build_panel_html())
+        stability_page.evaluate(MOCK_EXTENSION)
+        stability_page.add_script_tag(content=build_test_bundle())
+        stability_page.wait_for_function("document.querySelector('#statusBar').textContent !== ''", timeout=10000)
+        stability_page.wait_for_timeout(150)
+
+        # (1) Conversation switch before anything was synced: no forced pause.
+        # The real writer always follows WRITER_SESSION_CHANGED with a fresh
+        # WRITER_STATE from the rebound composer; mirror that here.
+        stability_page.evaluate("""
+          window.__mock.writer.session = 'writer-mock-2';
+          window.__mock.writer.epoch = 0;
+          window.__mock.emit({
+            type: 'WRITER_SESSION_CHANGED', tabId: window.__mock.writer.tabId,
+            writerSession: 'writer-mock-2', targetEpoch: 0
+          });
+          window.__mock.emit({
+            type: 'WRITER_STATE', tabId: window.__mock.writer.tabId,
+            writerSession: window.__mock.writer.session, reason: 'navigation_rebound',
+            state: {
+              composerReady: true, currentText: window.__mock.writer.text,
+              targetEpoch: window.__mock.writer.epoch,
+              pluginOwned: window.__mock.writer.pluginOwned, strategy: 'mock-native'
+            }
+          });
+        """)
+        stability_page.wait_for_timeout(150)
+        assert stability_page.locator("#pauseButton").inner_text() == "暂停", \
+            stability_page.locator("#statusBar").inner_text()
+
+        # (2) Slow down translations, pause mid-flight, and confirm the button
+        # comes back immediately instead of staying disabled forever.
+        stability_page.evaluate("""
+          const originalFetch = window.fetch;
+          window.fetch = async (...args) => {
+            await new Promise(resolve => setTimeout(resolve, 700));
+            return originalFetch(...args);
+          };
+        """)
+        stability_page.locator("#sourceText").fill("第一版")
+        stability_page.locator("#translateButton").click()
+        stability_page.wait_for_function(
+            "document.querySelector('#translateButton').disabled === true", timeout=10000
+        )
+        stability_page.locator("#sourceText").press("Escape")
+        stability_page.wait_for_function(
+            "document.querySelector('#translateButton').disabled === false", timeout=10000
+        )
+        assert stability_page.locator("#pauseButton").inner_text() == "恢复"
+        # Resume: the aborted draft has no current English, so this schedules a
+        # fresh translation that completes and syncs.
+        stability_page.locator("#sourceText").press("Escape")
+        stability_page.wait_for_function(
+            "document.querySelector('#englishText').value === 'First version.'", timeout=10000
+        )
+        stability_page.wait_for_function("window.__mock.writer.text === 'First version.'", timeout=10000)
+
+        # (3) Recoverable writer loss: pause, automatic re-bind, auto-resume.
+        stability_page.evaluate("""
+          window.__mock.emit({
+            type: 'TARGET_UNAVAILABLE', tabId: window.__mock.writer.tabId,
+            recoverable: true, message: 'Claude 页面连接已断开，正在等待自动恢复'
+          });
+        """)
+        stability_page.wait_for_function(
+            "document.querySelector('#pauseButton').textContent === '暂停'", timeout=10000
+        )
+        assert "已绑定" in stability_page.locator("#statusBar").inner_text() \
+            or "输入框" in stability_page.locator("#statusBar").inner_text(), \
+            stability_page.locator("#statusBar").inner_text()
+        assert stability_errors == [], stability_errors
+        stability_page.close()
+
         browser.close()
     print("panel browser state-machine test: PASS")
 

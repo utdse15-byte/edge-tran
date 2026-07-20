@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.6 — 2026-07-20
+
+Responses API 支持与使用稳定性修复版（针对用户反馈的四类问题）。
+
+### OpenAI Responses API（/v1/responses）
+
+- 设置新增"接口协议"选项：Chat Completions（默认）或 Responses API。协议是显式选择,插件仍不自动猜路由、不跨协议重试。
+- Responses 请求：system 提示词映射到 `instructions`,用户内容作为 `input_text` 输入项,`store: false` 退出服务端响应留存;JSON 模式使用 `text.format`。
+- Responses 解析:遍历 `output` 数组(忽略 o 系列 `reasoning` 项),`output_text` 拼接;`refusal` 部件 → 拒绝,`incomplete/max_output_tokens` → 截断,`function_call` 等工具项 → 硬拒绝;`failed` 状态归类为逻辑错误。
+- 协议错配双向可判定:Responses 模式收到 Chat Completions 结构(或反之)会提示到设置中切换协议。
+- 兼容降级把 `text.format` 参数拒绝映射到统一的 JSON 模式能力位,`temperature` 独立降级;能力签名纳入协议维度,切换协议不会误用另一协议学到的降级。
+- Base URL 规范化支持粘贴完整 `/responses` 地址;裸 `/responses` 收到 HTML 时同样提示可能缺少 API 前缀。
+
+### 使用稳定性（用户反馈修复）
+
+- 【回归修复】"立即翻译"按钮不再可能永久禁用:0.2.5 给按钮恢复加身份守卫后,任何经 `abortInFlight` 的中止(暂停、换绑、清空草稿、SW 重启)都会跳过恢复;现在中止即恢复按钮。
+- 空输入框定位:新增 1 秒级低频重扫。Claude 空态编辑器经属性级 hydration 变为可定位时(childList 观察器看不到),不再需要用户先往页面输入内容。
+- 普通换会话不再强制暂停:仅当插件拥有的文本被换会话孤立时才暂停;在途翻译不再被中止(写入侧本就有身份校验,中止只会浪费已计费请求),英文预览保留并提示可手动同步。
+- 可恢复的目标丢失(页面刷新、MV3 服务工作线程重启)自动重绑成功后自动恢复运行,不再每次都要人工点"恢复";用户主动暂停不受影响,仍需手动恢复。
+
+### 测试
+
+- Node 测试 62 → 66 项:Responses 请求构建与解析、text.format 降级、拒绝/截断/工具调用/协议错配、存储协议字段规范化与 URL 后缀剥离。
+- Writer Chromium 冒烟新增属性级 hydration 定位场景;Panel 状态机新增换会话不暂停、中止后按钮恢复、目标丢失自动恢复三个场景。
+
 ## 0.2.5 — 2026-07-20
 
 深度缺陷审查修复版（四路并行审查 + 逐项人工验证，共修复 1 高危 / 5 中危 / 7 低危）。

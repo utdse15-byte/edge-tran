@@ -1813,3 +1813,168 @@ test("rejects claude.ai as provider host in trailing-dot FQDN form", () => {
   // A trailing dot on an unrelated provider host stays allowed.
   assert.equal(normalizeBaseUrl("https://api.openai.com./v1"), "https://api.openai.com./v1");
 });
+
+test("responses protocol posts to /responses and parses typed output", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url: String(url), body: JSON.parse(options.body) });
+    return new Response(JSON.stringify({
+      object: "response",
+      status: "completed",
+      model: "gpt-responses",
+      output: [
+        { type: "reasoning", summary: [] },
+        {
+          type: "message",
+          role: "assistant",
+          content: [
+            { type: "output_text", text: "{\"english\":\"Hel" },
+            { type: "output_text", text: "lo\",\"corrections\":[],\"ambiguous\":[]}" }
+          ]
+        }
+      ]
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+
+  try {
+    const result = await chatCompletion({
+      config: {
+        baseUrl: "https://provider.example/v1",
+        apiProtocol: "responses",
+        timeoutMs: 1000,
+        capabilities: { jsonMode: null, temperature: null }
+      },
+      apiKey: "test-key",
+      model: "gpt-responses",
+      messages: [
+        { role: "system", content: "Translate only." },
+        { role: "user", content: "你好" }
+      ],
+      preferJson: true
+    });
+    assert.equal(requests.length, 1);
+    assert.ok(requests[0].url.endsWith("/v1/responses"), requests[0].url);
+    const body = requests[0].body;
+    assert.equal(body.instructions, "Translate only.");
+    assert.deepEqual(body.input, [
+      { role: "user", content: [{ type: "input_text", text: "你好" }] }
+    ]);
+    assert.deepEqual(body.text, { format: { type: "json_object" } });
+    assert.equal(body.temperature, 0);
+    assert.equal(body.store, false);
+    assert.equal("messages" in body, false);
+    assert.equal("response_format" in body, false);
+    assert.equal(result.text, "{\"english\":\"Hello\",\"corrections\":[],\"ambiguous\":[]}");
+    assert.equal(result.rawModel, "gpt-responses");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("responses protocol degrades text.format like response_format and keeps temperature", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (_url, options) => {
+    requests.push(JSON.parse(options.body));
+    if (requests.length === 1) {
+      return new Response(JSON.stringify({
+        error: { message: "Unsupported parameter: 'text.format' is not supported with this model.", param: "text.format" }
+      }), { status: 400, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({
+      object: "response",
+      status: "completed",
+      output: [{
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "{\"english\":\"Hi\"}" }]
+      }]
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+
+  try {
+    const result = await chatCompletion({
+      config: {
+        baseUrl: "https://provider.example/v1",
+        apiProtocol: "responses",
+        timeoutMs: 1000,
+        capabilities: { jsonMode: null, temperature: null }
+      },
+      apiKey: "test-key",
+      model: "m",
+      messages: [{ role: "user", content: "你好" }],
+      preferJson: true
+    });
+    assert.equal(requests.length, 2);
+    assert.deepEqual(requests[0].text, { format: { type: "json_object" } });
+    assert.equal("text" in requests[1], false);
+    assert.equal(requests[1].temperature, 0, "temperature must survive a text.format-only rejection");
+    assert.deepEqual(result.capabilityPatch, { jsonMode: false, temperature: true });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("responses protocol rejects refusals, truncation, tool calls and protocol mismatches", async () => {
+  const originalFetch = globalThis.fetch;
+  const config = {
+    baseUrl: "https://provider.example/v1",
+    apiProtocol: "responses",
+    timeoutMs: 1000,
+    capabilities: { jsonMode: false, temperature: false }
+  };
+  const attempt = () => chatCompletion({
+    config,
+    apiKey: "k",
+    model: "m",
+    messages: [{ role: "user", content: "你好" }],
+    preferJson: false
+  });
+  const respond = (payload) => new Response(JSON.stringify(payload), {
+    status: 200,
+    headers: { "Content-Type": "application/json" }
+  });
+
+  try {
+    globalThis.fetch = async () => respond({
+      object: "response",
+      status: "completed",
+      output: [{ type: "message", role: "assistant", content: [{ type: "refusal", refusal: "no" }] }]
+    });
+    await assert.rejects(attempt, (error) => error?.code === "model_refusal");
+
+    globalThis.fetch = async () => respond({
+      object: "response",
+      status: "incomplete",
+      incomplete_details: { reason: "max_output_tokens" },
+      output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "partial" }] }]
+    });
+    await assert.rejects(attempt, (error) => error?.code === "output_truncated");
+
+    globalThis.fetch = async () => respond({
+      object: "response",
+      status: "completed",
+      output: [{ type: "function_call", name: "translate", arguments: "{}" }]
+    });
+    await assert.rejects(attempt, (error) => error?.code === "incomplete_response");
+
+    globalThis.fetch = async () => respond({
+      model: "m",
+      choices: [{ finish_reason: "stop", message: { content: "hello" } }]
+    });
+    await assert.rejects(attempt, (error) => error?.code === "chat_completions_response");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("normalizes the stored api protocol and strips a pasted /responses suffix", () => {
+  assert.equal(normalizeStoredProvider({ apiProtocol: "responses" }).apiProtocol, "responses");
+  assert.equal(normalizeStoredProvider({ apiProtocol: "RESPONSES" }).apiProtocol, "chat_completions");
+  assert.equal(normalizeStoredProvider({}).apiProtocol, "chat_completions");
+  assert.equal(
+    normalizeBaseUrl("https://api.openai.com/v1/responses"),
+    "https://api.openai.com/v1"
+  );
+});
