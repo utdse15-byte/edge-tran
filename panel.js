@@ -135,6 +135,7 @@ const ui = {
   requestTimeoutMs: $("#requestTimeoutMs"),
   backTranslateDelayMs: $("#backTranslateDelayMs"),
   streamPreview: $("#streamPreview"),
+  strictReviewGate: $("#strictReviewGate"),
   allowFocusWrite: $("#allowFocusWrite"),
   clearStaleTarget: $("#clearStaleTarget"),
   protectedTerms: $("#protectedTerms"),
@@ -209,6 +210,17 @@ const state = {
   // (writer port died: page reload / MV3 restart), not by the user. A
   // successful automatic re-bind then resumes without a manual 恢复 click.
   pausedByTargetLoss: false,
+  // Why the CURRENT pause exists — decides how it may end:
+  //   "user"     Esc / 暂停 button: only the explicit 恢复 button resumes.
+  //   "review"   manual-edit banner shown: its own buttons resolve it.
+  //   "incident" interrupted/unverified write: 恢复 or a user-clicked 定位.
+  //   "system"   everything else (session switch, external clear, uncertain
+  //              send, kept manual text…): self-heals on the next semantic
+  //              source edit or a successful re-bind — no 恢复 click needed.
+  pauseKind: null,
+  // Set while a user-clicked 定位 is pending so its BOUND may also clear an
+  // "incident" pause (the click itself is the human acknowledgement).
+  userBindRequested: false,
   manualText: "",
   lastInputAt: 0,
   literalFragments: new Set(),
@@ -580,12 +592,36 @@ function restorePanelFocus(element, focusUsed) {
   });
 }
 
+// Every pause goes through here so paused/pauseKind/pausedByTargetLoss can
+// never drift apart. Kinds: "user" | "review" | "incident" | "system" — see
+// the state comment for how each one is allowed to end.
+function pauseAutomation(kind) {
+  state.paused = true;
+  state.pauseKind = kind;
+  state.pausedByTargetLoss = false;
+}
+
+function resumeAutomation() {
+  state.paused = false;
+  state.pauseKind = null;
+  state.pausedByTargetLoss = false;
+}
+
+// A "system" pause is bookkeeping, not a user decision: the next clear signal
+// of intent (typing new Chinese, a successful re-bind, switching automation
+// back on) lifts it automatically instead of demanding a 恢复 click.
+function resumeSystemPause(reason) {
+  if (!state.paused || state.pauseKind !== "system") return false;
+  resumeAutomation();
+  addDiagnostic(`系统性暂停已自动恢复（${reason}）`);
+  return true;
+}
+
 function showManualBanner(text) {
   abortInFlight();
   state.manualText = String(text ?? "");
   state.targetPhase = "manual";
-  state.paused = true;
-  state.pausedByTargetLoss = false;
+  pauseAutomation("review");
   ui.manualBanner.classList.remove("hidden");
   setStatus("检测到人工修改，自动覆盖已暂停", "paused");
   updateDraftUI();
@@ -943,8 +979,10 @@ function scheduleExternalConfigurationReload(reasons) {
         ...settings,
         backTranslationMode: normalizeBackTranslationMode(settings.backTranslationMode)
       };
-      state.paused = true;
-      state.pausedByTargetLoss = false;
+      // Adopt-and-continue: the reload above succeeded, so the new
+      // configuration is valid and there is nothing for the user to fix.
+      // Pausing here only manufactured a 恢复 click after every settings save
+      // in another window. In-flight requests were already invalidated.
       state.externalConfigurationChanged = true;
       state.formCapabilitySignature = null;
       state.formCapabilities = null;
@@ -955,13 +993,13 @@ function scheduleExternalConfigurationReload(reasons) {
       if (ui.settingsDialog.open) {
         ui.providerTestResult.textContent = "另一个 Edge 窗口修改了 Provider、Key 或翻译设置；当前表单可能已过期，请关闭后重新打开，或明确确认覆盖。";
       }
-      setStatus("检测到另一个窗口修改 Provider、Key 或翻译设置；自动流程已暂停，请核对后恢复", "paused");
-      addDiagnostic(`检测到外部配置变化（${reasonList.join("、")}），已作废在途请求并暂停`);
+      setStatus("已采纳另一个窗口的配置修改，自动流程继续", "idle");
+      addDiagnostic(`检测到外部配置变化（${reasonList.join("、")}），已采纳新配置并继续`);
+      scheduleTranslation();
     } catch (error) {
       invalidateFormRequests();
       invalidateRuntimeContext();
-      state.paused = true;
-      state.pausedByTargetLoss = false;
+      pauseAutomation("incident");
       setStatus("检测到配置变化，但重新读取失败；自动流程已暂停", "error");
       addDiagnostic(`外部配置变化后读取失败：${String(error?.message || "storage_error").slice(0, 120)}`);
     }
@@ -980,6 +1018,8 @@ function providerErrorMessage(error) {
     return error?.message || "翻译失败，请检查设置与网络";
   }
 
+  const gatewayNote = error.remoteMessage ? `（网关消息：${error.remoteMessage}）` : "";
+
   switch (error.code) {
     case "unauthorized":
       return "API Key、账户或模型权限无效";
@@ -989,6 +1029,12 @@ function providerErrorMessage(error) {
       return "Provider 请求超时";
     case "network_error":
       return "无法连接 Provider";
+    case "provider_unavailable":
+      return `Provider 网关返回 5xx${gatewayNote}${
+        error.protocol === "responses"
+          ? "；当前走 /v1/responses——若 Chat Completions 正常，请在设置里点“测试”做协议对比诊断"
+          : ""
+      }`;
     case "endpoint_not_found":
       return "Base URL 或接口路径不正确；请核对所选“接口协议”对应的端点（/chat/completions 或 /responses）";
     case "model_not_found":
@@ -1055,6 +1101,10 @@ function providerDiagnosticDetail(error) {
     details.push(`keys=${error.responseKeys.join(",")}`);
   }
   if (error.routeHint) details.push(`hint=${error.routeHint}`);
+  if (error.protocol) {
+    details.push(`proto=${error.protocol}${error.streamedRequest ? "+sse" : ""}`);
+  }
+  if (error.remoteMessage) details.push(`msg=${error.remoteMessage}`);
   return details.join(" · ");
 }
 
@@ -1157,6 +1207,9 @@ async function bindCurrentTab() {
     setStatus("请先在当前窗口打开 claude.ai", "error");
     return;
   }
+  // The click itself is a human acknowledgement: its BOUND may also clear an
+  // "incident" pause, which automatic re-binds never may.
+  state.userBindRequested = true;
   state.bindRetryCount = 0;
   if (state.bindRetryTimer) clearTimeout(state.bindRetryTimer);
   state.bindRetryTimer = null;
@@ -1243,14 +1296,21 @@ function handlePanelMessage(message) {
       state.bindRequestId = message.bindRequestId ?? state.bindRequestId;
       if (state.bindRetryTimer) clearTimeout(state.bindRetryTimer);
       state.bindRetryTimer = null;
-      if (state.pausedByTargetLoss) {
-        // The pause was only ever about the lost connection, and the target
-        // is bound again. Requiring a manual 恢复 here made every page
-        // reload / MV3 service-worker restart interrupt the workflow.
-        state.pausedByTargetLoss = false;
-        state.paused = false;
-        addDiagnostic("目标连接已自动恢复，自动翻译与同步继续");
+      if (state.pausedByTargetLoss || (state.paused && state.pauseKind === "system")) {
+        // A successful bind resolves every target-shaped pause (lost
+        // connection, SPA session switch, external clear…). Requiring a
+        // manual 恢复 here made each of those interrupt the workflow.
+        resumeAutomation();
+        addDiagnostic("目标连接已恢复，自动翻译与同步继续");
+        scheduleTranslation();
+      } else if (state.paused && state.pauseKind === "incident" && state.userBindRequested) {
+        // The user clicked 定位 while an interrupted-write pause was active:
+        // that click is the human acknowledgement the incident asked for.
+        resumeAutomation();
+        addDiagnostic("用户重新定位目标；中断事件视为已核对，自动流程继续");
+        scheduleTranslation();
       }
+      state.userBindRequested = false;
       state.target = {
         ...state.target,
         bound: true,
@@ -1305,8 +1365,7 @@ function handlePanelMessage(message) {
       // may still have been mutated, so adopt the real state and fail closed.
       if (message.ok) {
         abortInFlight();
-        state.paused = true;
-        state.pausedByTargetLoss = false;
+        pauseAutomation("incident");
         state.target.writerSession = message.writerSession ?? state.target.writerSession;
         state.target.targetEpoch = message.targetEpoch ?? state.target.targetEpoch + 1;
         state.target.pluginOwned = true;
@@ -1351,14 +1410,13 @@ function handlePanelMessage(message) {
       break;
     case "TARGET_CLEARED":
       abortInFlight();
-      state.paused = true;
-      state.pausedByTargetLoss = false;
+      pauseAutomation("system");
       state.target.targetEpoch = message.targetEpoch ?? state.target.targetEpoch + 1;
       state.target.pluginOwned = false;
       state.target.currentText = "";
       state.targetPhase = "empty";
       hideManualBanner();
-      setStatus("Claude 输入框被外部清空；中文草稿保留，自动同步已暂停", "paused");
+      setStatus("Claude 输入框被外部清空；中文草稿保留（继续输入即自动恢复同步）", "paused");
       updateTargetUI();
       updateDraftUI();
       addDiagnostic("检测到非发送式清空；未归档、未清除中文草稿");
@@ -1415,10 +1473,9 @@ function handlePanelMessage(message) {
       state.target.currentText = "";
       if (orphansPluginContent) {
         abortInFlight();
-        state.paused = true;
-        state.pausedByTargetLoss = false;
+        pauseAutomation("system");
         state.targetPhase = "session-changed";
-        setStatus("Claude 会话或路由已变化，旧绑定状态作废", "paused");
+        setStatus("Claude 会话或路由已变化（重新定位或继续输入即自动恢复）", "paused");
         addDiagnostic("Claude SPA 会话变化；需要重新确认输入框状态");
       } else {
         state.targetPhase = state.draft.english ? "preview-only" : "empty";
@@ -1443,10 +1500,18 @@ function handlePanelMessage(message) {
       // every one of which resets this flag — must never auto-resume: a stale
       // flag surviving into an unrelated pause (e.g. external configuration
       // review) would let a later successful rebind cancel that pause.
-      state.pausedByTargetLoss = !state.paused
-        && message.type === "TARGET_UNAVAILABLE"
-        && Boolean(message.recoverable);
-      state.paused = true;
+      {
+        const recoverableLoss = !state.paused
+          && message.type === "TARGET_UNAVAILABLE"
+          && Boolean(message.recoverable);
+        // Target loss is never the user's decision: classify as a system pause
+        // so a re-bind or continued typing resumes it. But an existing
+        // user/review/incident pause must keep its stricter kind.
+        if (!state.paused) pauseAutomation("system");
+        else state.paused = true;
+        state.pausedByTargetLoss = recoverableLoss;
+      }
+      state.userBindRequested = false;
       state.target.bound = false;
       state.target.connected = false;
       state.target.active = false;
@@ -1614,8 +1679,7 @@ async function clearStaleTargetOwned({
       state.target.targetEpoch = resultEpoch ?? state.target.targetEpoch;
       state.target.pluginOwned = false;
       state.targetPhase = "manual";
-      state.paused = true;
-      state.pausedByTargetLoss = false;
+      pauseAutomation("incident");
       bannerMessage = "清理过程中 Claude 输入框发生变化，自动覆盖已停止；请人工核对当前内容。";
       addDiagnostic(`旧译文清理被中断或回滚失败：${result.code}`);
       void requestWriter("REQUEST_WRITER_STATE", {});
@@ -1851,7 +1915,10 @@ async function translateNow({ forceSync = false, forceOverwrite = false, reason 
     state.draft.updatedAt = Date.now();
     state.draft.providerName = providerContext.provider.name;
     state.draft.model = providerContext.modelTranslate;
-    state.targetPhase = "ready";
+    // A "manual" phase survives translation: Claude still holds text the user
+    // chose to keep, so the sync gate must stay armed — clobbering it to
+    // "ready" here would let auto-sync bypass the kept-text protection.
+    if (state.targetPhase !== "manual") state.targetPhase = "ready";
     state.translatePhase = "ready";
     state.backPhase = providerContext.backTranslationMode === BACK_TRANSLATION_MODES.SAME_REQUEST
       ? "ready"
@@ -1867,15 +1934,16 @@ async function translateNow({ forceSync = false, forceOverwrite = false, reason 
     schedulePersist();
     updateDraftUI();
 
-    // Review gate: corrections, ambiguities and quantity/echo warnings are
-    // approvals to obtain, not notifications to file after the fact. With any
-    // of them pending, the English stays in the preview and the user's own
-    // 同步到 Claude click is the explicit approval that releases it.
-    const reviewRequired = result.corrections.length > 0
+    // Review reminders: corrections, ambiguities and quantity/echo warnings.
+    // Advisory by default — the English syncs into Claude's composer (never
+    // sent by us) and the reminders stay loudly visible for the user's own
+    // pre-send read-through. With 严格评审 enabled they become a hard gate:
+    // the English waits in the preview for an explicit 同步 click.
+    const reviewReminders = result.corrections.length > 0
       || result.ambiguities.length > 0
       || result.warnings.some((warning) => /数字|复述|回答式|语序/.test(warning));
-    if (reviewRequired) {
-      state.targetPhase = "ready";
+    if (reviewReminders && providerContext.settings.strictReviewGate) {
+      if (state.targetPhase !== "manual") state.targetPhase = "ready";
       setStatus("翻译完成，但存在需人工确认的纠错/歧义/数量提示；请核对后点“同步到 Claude”", "paused");
       updateDraftUI();
       if (providerContext.backTranslationMode === BACK_TRANSLATION_MODES.INDEPENDENT) {
@@ -1914,6 +1982,9 @@ async function translateNow({ forceSync = false, forceOverwrite = false, reason 
       else if (state.targetPhase === "ready") setStatus("翻译与同请求回译完成，请核对", "ready");
     } else if (state.targetPhase === "synced") {
       setStatus("已同步；回译已关闭", "ready");
+    }
+    if (reviewReminders && state.targetPhase === "synced") {
+      setStatus("已同步；存在纠错/歧义/数量提醒（见下方），发送前请过目", "paused");
     }
   } catch (error) {
     if (
@@ -2029,16 +2100,19 @@ async function syncEnglishNow({
     }
   }
   if (!operationIsCurrent() || !revisionIsCurrent()) return false;
-  if ((state.targetPhase === "manual" || state.paused) && !forceOverwrite) {
+  if (state.paused && !forceOverwrite) {
     // Never drop an explicit sync silently: without a status update the
     // 同步 button appears dead while paused, and the off-back-translation
     // flow would leave "正在准备同步…" on screen forever.
-    setStatus(
-      state.paused
-        ? "已暂停：英文未写入 Claude，按 Esc 或“恢复”后可同步"
-        : "Claude 输入框处于人工修改状态；请先在横幅中选择处理方式",
-      "paused"
-    );
+    setStatus("已暂停：英文未写入 Claude，点“恢复”后可同步", "paused");
+    updateDraftUI();
+    return false;
+  }
+  if (state.targetPhase === "manual" && !forceOverwrite) {
+    // Kept manual text is never overwritten silently — but automation keeps
+    // running: the fresh English stays in the preview and one explicit
+    // 同步 click (with its own confirm) performs the overwrite.
+    setStatus("英文已生成但未写入：Claude 输入框保留着你的人工文本；点“同步到 Claude”可覆盖", "ready");
     updateDraftUI();
     return false;
   }
@@ -2177,8 +2251,7 @@ async function syncEnglishNow({
   } else if (["write_failed_not_restored", "write_interrupted"].includes(result.code)) {
     state.target.targetEpoch = resultEpoch ?? state.target.targetEpoch;
     state.target.pluginOwned = false;
-    state.paused = true;
-    state.pausedByTargetLoss = false;
+    pauseAutomation("incident");
     state.targetPhase = "manual";
     setStatus("写入被中断或未能完整恢复，请人工核对 Claude 输入框", "error");
     void requestWriter("REQUEST_WRITER_STATE", {});
@@ -2342,6 +2415,10 @@ function handleSourceChange() {
   state.draft.sourceRevision = state.sourceRevision;
   state.draft.updatedAt = Date.now();
   abortInFlight();
+  // Typing new Chinese is the clearest "keep going" signal there is. It lifts
+  // system pauses only — an Esc/暂停 pause, an open manual-edit banner and an
+  // unverified write incident all still require their explicit resolution.
+  resumeSystemPause("输入了新内容");
 
   if (state.draft.english) {
     if (state.targetPhase === "manual") {
@@ -2404,7 +2481,7 @@ async function archiveAndReset(sentText) {
   state.translatePhase = "idle";
   state.backPhase = currentBackTranslationMode() === BACK_TRANSLATION_MODES.OFF ? "off" : "idle";
   state.targetPhase = "empty";
-  state.paused = false;
+  resumeAutomation();
   hideManualBanner();
   setStatus("检测到可信发送；旧稿已归档，新草稿已建立", "idle");
   updateDraftUI({ preserveSourceSelection: false });
@@ -2447,15 +2524,14 @@ async function archiveUncertainSend(sentText, details = {}) {
     state.history = state.history.slice(0, 20);
   }
 
-  state.paused = true;
-  state.pausedByTargetLoss = false;
+  pauseAutomation("system");
   state.targetPhase = "empty";
   state.draft.warnings = [...new Set([
     ...state.draft.warnings,
     "刚才发送的英文与当前中文或侧栏译文版本不完全一致；中文原稿已保留，请核对历史记录"
   ])];
   hideManualBanner();
-  setStatus("检测到发送，但版本一致性无法确认；中文草稿已保留", "error");
+  setStatus("检测到发送，但版本一致性无法确认；中文草稿已保留（继续输入即自动恢复）", "error");
   updateDraftUI();
   updateStaleBanner("已发送的英文与当前中文/译文版本不完全一致。为防止丢稿，中文原稿没有清空；请核对历史记录后再继续。");
   renderHistory();
@@ -2500,7 +2576,7 @@ async function clearCurrentDraft() {
   state.translatePhase = "idle";
   state.backPhase = currentBackTranslationMode() === BACK_TRANSLATION_MODES.OFF ? "off" : "idle";
   if (!targetStillContainsText) {
-    state.paused = false;
+    resumeAutomation();
     state.targetPhase = "empty";
     hideManualBanner();
     setStatus("当前草稿已清空", "idle");
@@ -2513,11 +2589,10 @@ async function clearCurrentDraft() {
     setStatus("侧栏草稿已清空，但 Claude 输入框仍有内容；自动同步保持暂停", "error");
     updateDraftUI({ preserveSourceSelection: false });
   } else {
-    state.paused = true;
-    state.pausedByTargetLoss = false;
+    pauseAutomation("system");
     state.targetPhase = "stale-uncleared";
     hideManualBanner();
-    setStatus("侧栏草稿已清空，但 Claude 中仍保留旧英文", "error");
+    setStatus("侧栏草稿已清空，但 Claude 中仍保留旧英文（继续输入即自动恢复）", "error");
     updateDraftUI({ preserveSourceSelection: false });
     updateStaleBanner(
       clearResult?.code === "protected_content_present"
@@ -2680,6 +2755,7 @@ function fillSettingsForm() {
   ui.requestTimeoutMs.value = state.settings.requestTimeoutMs;
   ui.backTranslateDelayMs.value = state.settings.backTranslateDelayMs;
   ui.streamPreview.checked = Boolean(state.settings.streamPreview);
+  ui.strictReviewGate.checked = Boolean(state.settings.strictReviewGate);
   ui.allowFocusWrite.checked = Boolean(state.settings.allowFocusWrite);
   ui.clearStaleTarget.checked = Boolean(state.settings.clearStaleTarget);
   ui.protectedTerms.value = (state.settings.protectedTerms ?? []).join("\n");
@@ -2802,6 +2878,7 @@ function settingsFromForm() {
     requestTimeoutMs: clampInteger(ui.requestTimeoutMs.value, 5000, 120000, DEFAULT_SETTINGS.requestTimeoutMs),
     backTranslateDelayMs: clampInteger(ui.backTranslateDelayMs.value, 300, 5000, DEFAULT_SETTINGS.backTranslateDelayMs),
     streamPreview: ui.streamPreview.checked,
+    strictReviewGate: ui.strictReviewGate.checked,
     allowFocusWrite: ui.allowFocusWrite.checked,
     clearStaleTarget: ui.clearStaleTarget.checked,
     protectedTerms: ui.protectedTerms.value
@@ -2953,9 +3030,71 @@ async function detectModelsFromForm() {
   }
 }
 
+// After a failed explicit connection test, run at most two cheap follow-up
+// probes to pinpoint WHERE the failure lives: the SSE route, the /v1/responses
+// route, or the whole gateway. Never runs during automatic translation.
+async function runProviderFailureProbes(error, context, request) {
+  if (!context || !(error instanceof ProviderError)) return "";
+  const status = Number(error.status);
+  if (!(status >= 500 || status === 404 || status === 405)) return "";
+  const probe = async (overrides = {}) => {
+    try {
+      await testTranslationConnection({
+        config: { ...context.requestConfig, ...(overrides.config ?? {}) },
+        apiKey: context.secret,
+        model: context.model,
+        backTranslationMode: BACK_TRANSLATION_MODES.OFF,
+        streaming: Boolean(overrides.streaming),
+        signal: request.controller.signal
+      });
+      return { ok: true };
+    } catch (probeError) {
+      if (probeError?.name === "AbortError") throw probeError;
+      return { ok: false, error: probeError };
+    }
+  };
+  try {
+    ui.providerTestResult.textContent = "测试失败，正在定位原因（最多 2 次小请求）…";
+    // ① Streamed request failed → same protocol, buffered.
+    if (error.streamedRequest) {
+      const buffered = await probe({ streaming: false });
+      if (!formRequestIsCurrent(request)) return "";
+      if (buffered.ok) {
+        // Persist through the existing capability mechanism so 保存 makes the
+        // live path degrade to buffered automatically.
+        context.provider.capabilities = { ...context.provider.capabilities, streaming: false };
+        state.formCapabilitySignature = `${context.provider.baseUrl}\n${context.provider.modelTranslate}\n${normalizedApiProtocol(context.provider)}`;
+        state.formCapabilities = clone(context.provider.capabilities);
+        return "同协议缓冲请求正常，仅流式(SSE)失败——已把此 Provider 标记为不支持流式，点“保存”后翻译会自动改走缓冲";
+      }
+    }
+    // ② /v1/responses failed → same gateway, chat/completions.
+    if (normalizedApiProtocol(context.requestConfig) === "responses") {
+      const chat = await probe({ config: { apiProtocol: "chat_completions" }, streaming: false });
+      if (!formRequestIsCurrent(request)) return "";
+      if (chat.ok) {
+        return `同网关 chat/completions 正常，仅 /v1/responses 失败（HTTP ${status}${
+          error.remoteMessage ? `，网关消息：${error.remoteMessage}` : ""
+        }）——请检查网关的 responses 路由/模型通道映射，或暂时切回 Chat Completions`;
+      }
+      const chatDetail = chat.error instanceof ProviderError
+        ? `${chat.error.code}${Number.isFinite(chat.error.status) ? ` HTTP ${chat.error.status}` : ""}`
+        : "失败";
+      return `chat/completions 同样失败（${chatDetail}）——网关或网络整体异常，与接口协议无关`;
+    }
+  } catch (probeError) {
+    if (probeError?.name !== "AbortError") {
+      addDiagnostic(`失败定位探测中断：${String(probeError?.message || "probe_error").slice(0, 120)}`);
+    }
+    return "";
+  }
+  return "";
+}
+
 async function testProviderFromForm() {
   const request = beginFormRequest(ui.testProviderButton);
   ui.providerTestResult.textContent = "正在做真实翻译测试…";
+  let probeContext = null;
   try {
     const provider = providerFromForm();
     if (!hasFormSecretCandidate(provider)) throw new Error("请先填写 API Key");
@@ -2972,11 +3111,23 @@ async function testProviderFromForm() {
       ...provider,
       timeoutMs: Number(ui.requestTimeoutMs.value) || 20000
     };
+    // Mirror the live transport: with 流式预览 on, real translations stream,
+    // so the test must stream too or a broken SSE route passes the test and
+    // then fails every real request.
+    const mirrorStreaming = ui.streamPreview.checked && provider.capabilities?.streaming !== false;
+    probeContext = {
+      requestConfig,
+      secret,
+      model: provider.modelTranslate,
+      provider,
+      transportLabel: mirrorStreaming ? "流式" : "缓冲"
+    };
     const result = await testTranslationConnection({
       config: requestConfig,
       apiKey: secret,
       model: provider.modelTranslate,
       backTranslationMode: backMode,
+      streaming: mirrorStreaming,
       signal: request.controller.signal
     });
     if (!formRequestIsCurrent(request)) return;
@@ -3012,10 +3163,14 @@ async function testProviderFromForm() {
     const reasoningNote = Number.isFinite(result.reasoningTokens)
       ? ` · reasoning=${result.reasoningTokens}`
       : "";
-    ui.providerTestResult.textContent = `通过 · ${Math.round(performance.now() - started)} ms${reasoningNote} · ${result.english.slice(0, 70)}${backPreview}`;
+    ui.providerTestResult.textContent = `通过 · ${Math.round(performance.now() - started)} ms · ${probeContext.transportLabel}${reasoningNote} · ${result.english.slice(0, 70)}${backPreview}`;
   } catch (error) {
     if (error?.name !== "AbortError" && formRequestIsCurrent(request)) {
-      ui.providerTestResult.textContent = providerFormErrorMessage(error) || error.message;
+      const baseMessage = providerFormErrorMessage(error) || error.message;
+      ui.providerTestResult.textContent = baseMessage;
+      const verdict = await runProviderFailureProbes(error, probeContext, request);
+      if (!formRequestIsCurrent(request)) return;
+      if (verdict) ui.providerTestResult.textContent = `${baseMessage} ｜ 诊断：${verdict}`;
     }
   } finally {
     finishFormRequest(request);
@@ -3065,8 +3220,7 @@ function renderHistory() {
         providerName: item.providerName,
         model: item.model
       });
-      state.paused = true;
-      state.pausedByTargetLoss = false;
+      pauseAutomation("system");
       state.translatePhase = "idle";
       state.backPhase = state.draft.backTranslation
         ? "ready"
@@ -3079,7 +3233,7 @@ function renderHistory() {
       }
       schedulePersist();
       updateDraftUI({ preserveSourceSelection: false });
-      setStatus("历史草稿已恢复；请检查后重新翻译", "paused");
+      setStatus("历史草稿已恢复；确认无误可直接编辑继续（输入即恢复自动流程）", "paused");
       ui.historyDialog.close();
       ui.sourceText.focus({ preventScroll: true });
     });
@@ -3243,11 +3397,13 @@ async function diagnosticClear() {
 }
 
 async function keepManualVersion() {
-  state.paused = true;
-  state.pausedByTargetLoss = false;
+  // Downgrade the review pause to a system pause: the user has made their
+  // choice, so the next Chinese edit resumes automation without a 恢复 click
+  // (and only a NEW translation may overwrite the kept text).
+  pauseAutomation("system");
   state.targetPhase = "manual";
   hideManualBanner();
-  setStatus("已保留 Claude 中的人工英文；自动同步保持暂停", "paused");
+  setStatus("已保留 Claude 中的人工英文；继续输入新内容将自动恢复同步", "paused");
   updateDraftUI();
 }
 
@@ -3291,15 +3447,14 @@ async function useManualAsBaseline() {
     : "manual_independent";
   state.backPhase = backMode === BACK_TRANSLATION_MODES.OFF ? "off" : "idle";
   state.targetPhase = "manual";
-  state.paused = true;
-  state.pausedByTargetLoss = false;
+  pauseAutomation("system");
   hideManualBanner();
   schedulePersist();
   updateDraftUI();
   setStatus(
     backMode === BACK_TRANSLATION_MODES.OFF
-      ? "人工英文已作为基线；回译已关闭，自动同步保持暂停"
-      : "人工英文已作为核对基线；不会被自动覆盖",
+      ? "人工英文已作为基线；回译已关闭（继续输入即恢复自动流程）"
+      : "人工英文已作为核对基线；不会被自动覆盖（继续输入即恢复自动流程）",
     "paused"
   );
   if (textResult.text && backMode !== BACK_TRANSLATION_MODES.OFF) {
@@ -3329,6 +3484,7 @@ function bindEvents() {
     if (event.isComposing || event.keyCode === 229) return;
     if (event.key === "Enter" && event.ctrlKey) {
       event.preventDefault();
+      resumeSystemPause("Ctrl+Enter 显式触发");
       void translateNow({ forceSync: true, forceOverwrite: false, reason: "shortcut" });
     } else if (event.key === "Escape") {
       event.preventDefault();
@@ -3336,11 +3492,13 @@ function bindEvents() {
       // second Esc must never re-arm auto translate/sync — resuming requires
       // the explicit 恢复 button.
       if (state.paused) {
+        // Escalate any softer pause to a user pause: pressing Esc while a
+        // self-healing system pause is active means "stay stopped".
+        state.pauseKind = "user";
         setStatus("已处于暂停状态；恢复请点击“恢复”按钮", "paused");
         return;
       }
-      state.paused = true;
-      state.pausedByTargetLoss = false;
+      pauseAutomation("user");
       abortInFlight();
       setStatus("自动翻译与同步已暂停（Esc 仅暂停，恢复请点按钮）", "paused");
       updateDraftUI();
@@ -3348,10 +3506,13 @@ function bindEvents() {
   });
 
   ui.bindButton.addEventListener("click", () => void bindCurrentTab());
-  ui.translateButton.addEventListener("click", () => void translateNow({ forceSync: true, reason: "button" }));
+  ui.translateButton.addEventListener("click", () => {
+    resumeSystemPause("点击翻译并同步");
+    void translateNow({ forceSync: true, reason: "button" });
+  });
   ui.pauseButton.addEventListener("click", () => {
-    state.paused = !state.paused;
-    state.pausedByTargetLoss = false;
+    if (state.paused) resumeAutomation();
+    else pauseAutomation("user");
     if (state.paused) abortInFlight();
     else scheduleTranslation();
     setStatus(state.paused ? "自动翻译与同步已暂停" : "自动翻译与同步已恢复", state.paused ? "paused" : "idle");
@@ -3368,7 +3529,10 @@ function bindEvents() {
     state.settings.autoSync = mode !== "manual";
     observeBackgroundTask(persistSettings(state.settings), "设置");
     if (mode === "manual") abortInFlight();
-    else scheduleTranslation();
+    else {
+      resumeSystemPause("切换自动化模式");
+      scheduleTranslation();
+    }
     setStatus(
       mode === "manual"
         ? "手动模式：不自动请求模型，点“翻译并同步”触发"
@@ -3379,6 +3543,7 @@ function bindEvents() {
     );
   });
   ui.syncButton.addEventListener("click", async () => {
+    resumeSystemPause("点击同步到 Claude");
     const force = state.targetPhase === "manual" || (state.target.currentText && !state.target.pluginOwned);
     if (force && !confirm("这会覆盖 Claude 输入框中的人工内容，是否继续？")) return;
     await syncEnglish({ forceOverwrite: force, revision: state.sourceRevision });
@@ -3388,7 +3553,7 @@ function bindEvents() {
   ui.keepManualButton.addEventListener("click", () => void keepManualVersion());
   ui.regenerateButton.addEventListener("click", () => {
     if (!confirm("将用最新中文重新翻译，并覆盖你在 Claude 输入框中的人工修改。是否继续？")) return;
-    state.paused = false;
+    resumeAutomation();
     hideManualBanner();
     void translateNow({ forceSync: true, forceOverwrite: true, reason: "manual_reclaim" });
   });

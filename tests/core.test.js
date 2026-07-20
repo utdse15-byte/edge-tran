@@ -34,6 +34,7 @@ import {
   backTranslate,
   buildPreviewDisplayText,
   createEnglishStreamExtractor,
+  testTranslationConnection,
   translateDraft
 } from "../lib/translator.js";
 import {
@@ -2570,4 +2571,152 @@ test("reasoning settings normalize safely and stay out of the credential binding
     providerCredentialBinding(withReasoning),
     "changing the thinking policy must not invalidate stored keys"
   );
+});
+
+test("http errors carry sanitized gateway evidence with protocol and transport stamps", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      error: {
+        message: "no available channel for /v1/responses (key sk-abcdef123456 rejected)",
+        code: "bad_gateway"
+      }
+    }), {
+      status: 502,
+      headers: { "Content-Type": "application/json", "x-request-id": "req-12345" }
+    });
+    await assert.rejects(
+      chatCompletion({
+        config: {
+          baseUrl: "https://provider.example/v1",
+          apiProtocol: "responses",
+          timeoutMs: 1000,
+          capabilities: { jsonMode: false, temperature: false, streaming: null }
+        },
+        apiKey: "k",
+        model: "m",
+        messages: [{ role: "user", content: "你好" }]
+      }),
+      (error) => {
+        assert.equal(error.code, "provider_unavailable");
+        assert.equal(error.status, 502);
+        assert.ok(error.remoteMessage.includes("no available channel"), error.remoteMessage);
+        assert.ok(!error.remoteMessage.includes("sk-abcdef"), "credentials must be masked");
+        assert.equal(error.requestId, "req-12345");
+        assert.equal(error.protocol, "responses");
+        assert.equal(error.streamedRequest, false);
+        assert.ok(String(error.endpoint).includes("/responses"), error.endpoint);
+        return true;
+      }
+    );
+
+    // The same 502 on a STREAMED chat request is stamped accordingly.
+    await assert.rejects(
+      chatCompletion({
+        config: {
+          baseUrl: "https://provider.example/v1",
+          timeoutMs: 1000,
+          capabilities: { jsonMode: false, temperature: false, streaming: null }
+        },
+        apiKey: "k",
+        model: "m",
+        messages: [{ role: "user", content: "你好" }],
+        onTextDelta: () => {}
+      }),
+      (error) => error.protocol === "chat_completions" && error.streamedRequest === true
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("auth failures keep the request id but never the remote error body", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      error: { message: "invalid key sk-secret123456" }
+    }), {
+      status: 401,
+      headers: { "Content-Type": "application/json", "x-request-id": "req-auth-1" }
+    });
+    await assert.rejects(
+      chatCompletion({
+        config: {
+          baseUrl: "https://provider.example/v1",
+          timeoutMs: 1000,
+          capabilities: { jsonMode: false, temperature: false, streaming: null }
+        },
+        apiKey: "k",
+        model: "m",
+        messages: [{ role: "user", content: "你好" }]
+      }),
+      (error) => {
+        assert.equal(error.code, "unauthorized");
+        assert.equal(error.remoteMessage, "", "auth error bodies must never be retained");
+        assert.equal(error.requestId, "req-auth-1");
+        return true;
+      }
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("connection test mirrors the live transport when streaming is requested", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  const validBody = JSON.stringify({
+    choices: [{
+      finish_reason: "stop",
+      message: {
+        role: "assistant",
+        content: JSON.stringify({
+          english: "Please only review this code without rewriting the structure.",
+          corrections: [],
+          ambiguous: []
+        })
+      }
+    }]
+  });
+  globalThis.fetch = async (_url, options) => {
+    requests.push(JSON.parse(options.body));
+    return new Response(validBody, {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+  const config = {
+    baseUrl: "https://provider.example/v1",
+    timeoutMs: 1000,
+    capabilities: { jsonMode: true, temperature: false, streaming: null }
+  };
+  try {
+    const result = await testTranslationConnection({
+      config,
+      apiKey: "k",
+      model: "m",
+      backTranslationMode: BACK_TRANSLATION_MODES.OFF,
+      streaming: true
+    });
+    assert.equal(requests[0].stream, true, "streamed test must actually send stream:true");
+    assert.ok(result.english.length > 0);
+
+    requests.length = 0;
+    await testTranslationConnection({
+      config,
+      apiKey: "k",
+      model: "m",
+      backTranslationMode: BACK_TRANSLATION_MODES.OFF,
+      streaming: false
+    });
+    assert.equal(requests[0].stream, false, "buffered probe must not stream");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("strict review gate setting normalizes to a boolean and defaults off", () => {
+  assert.equal(normalizeStoredSettings({}).strictReviewGate, false);
+  assert.equal(normalizeStoredSettings({ strictReviewGate: true }).strictReviewGate, true);
+  assert.equal(normalizeStoredSettings({ strictReviewGate: "yes" }).strictReviewGate, false);
 });
