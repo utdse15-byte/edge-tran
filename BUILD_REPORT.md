@@ -1,6 +1,6 @@
 # Build Report
 
-- Version: **0.2.7**
+- Version: **0.2.8**
 - Date: 2026-07-20
 - Baseline: `npm run verify:full` 全部通过
   - Node 测试（`node --test tests/*.test.js`）

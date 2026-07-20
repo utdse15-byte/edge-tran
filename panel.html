@@ -200,6 +200,7 @@
         <label>请求超时（毫秒）
           <input id="requestTimeoutMs" type="number" min="5000" max="120000" step="1000">
         </label>
+        <label class="inline-checkbox"><input id="streamPreview" type="checkbox">生成过程中流式显示英文预览（不影响写入 Claude 的完整校验）</label>
         <label class="inline-checkbox"><input id="allowFocusWrite" type="checkbox">无焦点策略失败时，允许短暂聚焦 Claude 输入框</label>
         <label class="inline-checkbox"><input id="clearStaleTarget" type="checkbox">中文一修改，就尝试无焦点清除 Claude 中的旧译文</label>
         <label>保护词（每行一个，原样保留）

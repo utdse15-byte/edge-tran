@@ -3,7 +3,7 @@
   "name": "Claude 中文→英文输入助手",
   "short_name": "中译英助手",
   "description": "在 Edge 侧边栏输入中文，使用自备 GPT、Grok 或 OpenAI 兼容供应商一次生成英文与中文回译并同步到 Claude；也可切换独立回译。",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "minimum_chrome_version": "118",
   "permissions": [
     "storage",

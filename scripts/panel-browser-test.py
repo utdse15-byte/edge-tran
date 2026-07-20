@@ -663,6 +663,31 @@ def main() -> None:
         assert "已绑定" in stability_page.locator("#statusBar").inner_text() \
             or "输入框" in stability_page.locator("#statusBar").inner_text(), \
             stability_page.locator("#statusBar").inner_text()
+
+        # Speed regressions: a normalized-equivalent edit (trailing space) must
+        # not re-bill a translation, and returning to an already-translated
+        # draft must replay from the session cache instead of the Provider.
+        calls_before = stability_page.evaluate("window.__mock.translationCalls")
+        stability_page.locator("#sourceText").fill("第一版 ")
+        stability_page.wait_for_timeout(700)
+        assert stability_page.evaluate("window.__mock.translationCalls") == calls_before, \
+            "trailing-whitespace edit must not trigger a paid re-translation"
+        assert stability_page.evaluate("document.querySelector('#englishText').value") == "First version."
+
+        stability_page.locator("#sourceText").fill("第二版。")
+        stability_page.wait_for_function(
+            f"window.__mock.translationCalls === {calls_before + 1}", timeout=10000
+        )
+        stability_page.wait_for_function(
+            "document.querySelector('#englishText').value === 'Second version.'", timeout=10000
+        )
+        stability_page.locator("#sourceText").fill("第一版")
+        stability_page.wait_for_function(
+            "document.querySelector('#englishText').value === 'First version.'", timeout=10000
+        )
+        assert stability_page.evaluate("window.__mock.translationCalls") == calls_before + 1, \
+            "returning to a cached draft must replay without a Provider request"
+
         assert stability_errors == [], stability_errors
         stability_page.close()
 

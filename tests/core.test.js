@@ -26,7 +26,12 @@ import {
   validateEnglishTranslationText,
   validateTranslationPayload
 } from "../lib/validation.js";
-import { backTranslate, translateDraft } from "../lib/translator.js";
+import {
+  backTranslate,
+  buildPreviewDisplayText,
+  createEnglishStreamExtractor,
+  translateDraft
+} from "../lib/translator.js";
 import {
   getSecretForProvider,
   loadDraftState,
@@ -1226,7 +1231,7 @@ test("normalizes malformed stored settings and provider data before runtime use"
   assert.equal(provider.keyStorage, "local");
   assert.equal([...provider.modelTranslate].length, 240);
   assert.deepEqual(provider.extraHeaders, {});
-  assert.deepEqual(provider.capabilities, { jsonMode: null, temperature: false });
+  assert.deepEqual(provider.capabilities, { jsonMode: null, temperature: false, streaming: null });
 
   const providerWithDangerousKeys = normalizeStoredProvider({
     authHeader: "Content-Type",
@@ -2206,4 +2211,182 @@ test("protected terms deduplicate before the cap is applied", () => {
   const values = result.placeholders.map((item) => item.value);
   assert.ok(values.includes("尾部真词"), values);
   assert.ok(values.includes("重复词"), values);
+});
+
+function sseResponse(frames, { status = 200 } = {}) {
+  const encoder = new TextEncoder();
+  return new Response(new ReadableStream({
+    start(controller) {
+      for (const frame of frames) controller.enqueue(encoder.encode(frame));
+      controller.close();
+    }
+  }), { status, headers: { "Content-Type": "text/event-stream" } });
+}
+
+test("streams chat completions over SSE and reassembles the strict payload", async () => {
+  const originalFetch = globalThis.fetch;
+  const deltas = [];
+  globalThis.fetch = async (_url, options) => {
+    const body = JSON.parse(options.body);
+    assert.equal(body.stream, true);
+    return sseResponse([
+      'data: {"model":"m","choices":[{"delta":{"role":"assistant","content":"{\\"english\\":\\"Hel"}}]}\n\n',
+      'data: {"choices":[{"delta":{"content":"lo\\"}"}}]}\n\ndata: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+      "data: [DONE]\n\n"
+    ]);
+  };
+  try {
+    const result = await chatCompletion({
+      config: { baseUrl: "https://provider.example/v1", timeoutMs: 1000, capabilities: { jsonMode: false, temperature: false, streaming: null } },
+      apiKey: "k",
+      model: "m",
+      messages: [{ role: "user", content: "你好" }],
+      preferJson: false,
+      onTextDelta: (delta) => deltas.push(delta)
+    });
+    assert.equal(result.text, "{\"english\":\"Hello\"}");
+    assert.equal(deltas.join(""), "{\"english\":\"Hello\"}");
+    assert.equal(result.capabilityPatch.streaming, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("streams responses-protocol SSE and validates the final completed object", async () => {
+  const originalFetch = globalThis.fetch;
+  const deltas = [];
+  const finalResponse = {
+    object: "response",
+    status: "completed",
+    model: "m",
+    output: [{
+      type: "message", role: "assistant", status: "completed",
+      content: [{ type: "output_text", text: "streamed ok" }]
+    }]
+  };
+  globalThis.fetch = async () => sseResponse([
+    'data: {"type":"response.output_text.delta","delta":"streamed "}\n\n',
+    'data: {"type":"response.output_text.delta","delta":"ok"}\n\n',
+    `data: ${JSON.stringify({ type: "response.completed", response: finalResponse })}\n\n`
+  ]);
+  try {
+    const result = await chatCompletion({
+      config: { baseUrl: "https://provider.example/v1", apiProtocol: "responses", timeoutMs: 1000, capabilities: { jsonMode: false, temperature: false, streaming: null } },
+      apiKey: "k",
+      model: "m",
+      messages: [{ role: "user", content: "你好" }],
+      preferJson: false,
+      onTextDelta: (delta) => deltas.push(delta)
+    });
+    assert.equal(result.text, "streamed ok");
+    assert.deepEqual(deltas, ["streamed ", "ok"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("falls back transparently when a gateway ignores stream and degrades when it rejects stream", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    // Gateway ignores stream:true and answers with buffered JSON.
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      choices: [{ finish_reason: "stop", message: { role: "assistant", content: "buffered" } }]
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+    const deltas = [];
+    const buffered = await chatCompletion({
+      config: { baseUrl: "https://provider.example/v1", timeoutMs: 1000, capabilities: { jsonMode: false, temperature: false, streaming: null } },
+      apiKey: "k", model: "m",
+      messages: [{ role: "user", content: "你好" }],
+      preferJson: false,
+      onTextDelta: (delta) => deltas.push(delta)
+    });
+    assert.equal(buffered.text, "buffered");
+    assert.deepEqual(deltas, []);
+
+    // Gateway rejects the stream parameter → one retry without streaming.
+    const requests = [];
+    globalThis.fetch = async (_url, options) => {
+      requests.push(JSON.parse(options.body));
+      if (requests.length === 1) {
+        return new Response(JSON.stringify({
+          error: { message: "Unsupported parameter: stream", param: "stream" }
+        }), { status: 400, headers: { "Content-Type": "application/json" } });
+      }
+      return new Response(JSON.stringify({
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "no stream" } }]
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    };
+    const degraded = await chatCompletion({
+      config: { baseUrl: "https://provider.example/v1", timeoutMs: 1000, capabilities: { jsonMode: null, temperature: null, streaming: null } },
+      apiKey: "k", model: "m",
+      messages: [{ role: "user", content: "你好" }],
+      preferJson: true,
+      onTextDelta: () => {}
+    });
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0].stream, true);
+    assert.equal(requests[1].stream, false);
+    assert.deepEqual(requests[1].response_format, { type: "json_object" }, "JSON mode must survive a stream-only rejection");
+    assert.equal(degraded.capabilityPatch.streaming, false);
+    assert.equal(degraded.capabilityPatch.jsonMode, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("english stream extractor decodes escapes across chunk boundaries and hides partial tokens", () => {
+  const seen = [];
+  const extractor = createEnglishStreamExtractor((english) => seen.push(english));
+  extractor.push('{"eng');
+  extractor.push('lish": "Line\\');
+  extractor.push('nTwo \\u');
+  extractor.push('4F60 and \\"quoted\\""');
+  extractor.push(', "corrections": []}');
+  assert.equal(seen.at(-1), 'Line\nTwo 你 and "quoted"');
+
+  const protection = protectText("运行 `npm test` 后检查", []);
+  const token = protection.placeholders[0].token;
+  const partial = token.slice(0, token.length - 2);
+  assert.equal(
+    buildPreviewDisplayText(`Run ${partial}`, protection.placeholders),
+    "Run "
+  );
+  assert.equal(
+    buildPreviewDisplayText(`Run ${token} then check`, protection.placeholders),
+    "Run `npm test` then check"
+  );
+});
+
+test("translateDraft streams the english preview while returning fully validated output", async () => {
+  const originalFetch = globalThis.fetch;
+  const previews = [];
+  const payloadText = JSON.stringify({
+    english: "Please review the code.",
+    back_translation: "请检查这段代码。",
+    corrections: [],
+    ambiguous: []
+  });
+  const escaped = JSON.stringify(payloadText).slice(1, -1);
+  const half = Math.floor(escaped.length / 2);
+  globalThis.fetch = async () => sseResponse([
+    `data: {"choices":[{"delta":{"role":"assistant","content":"${escaped.slice(0, half)}"}}]}\n\n`,
+    `data: {"choices":[{"delta":{"content":"${escaped.slice(half)}"}}]}\n\n`,
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+    "data: [DONE]\n\n"
+  ]);
+  try {
+    const result = await translateDraft({
+      source: "请检查这段代码。",
+      config: { baseUrl: "https://provider.example/v1", timeoutMs: 1000, capabilities: { jsonMode: true, temperature: false, streaming: null } },
+      apiKey: "k",
+      model: "m",
+      onEnglishPreview: (text) => previews.push(text)
+    });
+    assert.equal(result.english, "Please review the code.");
+    assert.ok(previews.length >= 1, previews);
+    assert.equal(previews.at(-1), "Please review the code.");
+    assert.ok(previews.every((text, index) => index === 0 || text.startsWith(previews[index - 1])));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
