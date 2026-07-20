@@ -208,5 +208,30 @@ with sync_playwright() as p:
   assert manual_switch and manual_switch['ok'] and manual_switch['state']['composerReady'], (manual_switch, page.evaluate('window.__h.messages'))
   assert not page.evaluate('window.__h.messages.some(m=>m.type==="TARGET_CLEARED")'), page.evaluate('window.__h.messages')
   assert page.locator('#editor').inner_text()=='still here'
+  page.close()
+
+  # Claude's empty-state editor can become locatable through attribute-only
+  # hydration, which a childList observer never reports. The periodic scan
+  # must locate it without the user having to type into the page first.
+  page=b.new_page(viewport={'width':1200,'height':800})
+  page.set_content('''<!doctype html><body><div style="height:500px"></div>
+    <form onsubmit="return false">
+      <div id="editor" contenteditable="true" style="width:700px;height:120px;border:1px solid"></div>
+      <button id="toolbar" type="button">Go</button>
+    </form>
+  </body>''')
+  page.evaluate('''() => {const messages=[];const msgListeners=[];const disconnect=[];const port={postMessage(m){messages.push(structuredClone(m));},onMessage:{addListener(fn){msgListeners.push(fn)}},onDisconnect:{addListener(fn){disconnect.push(fn)}},disconnect(){for(const fn of disconnect)fn();}};window.__h={messages,msgListeners,disconnect};window.chrome={runtime:{id:'test',connect(){return port}}};}''')
+  page.add_script_tag(content=js); page.wait_for_timeout(30)
+  page.evaluate('(m)=>window.__h.msgListeners[0](m)', {'type':'ATTACH','lease':'L'}); page.wait_for_timeout(60)
+  st=send(page, {'type':'REQUEST_WRITER_STATE','requestId':'pre-hydrate','lease':'L'})
+  assert st['ok'] and not st['state']['composerReady'], st
+  # Attribute-only hydration: add the message hint and send-button label.
+  page.evaluate('''() => {
+    document.getElementById('editor').setAttribute('aria-label', 'Message Claude');
+    document.getElementById('toolbar').setAttribute('aria-label', 'Send message');
+  }''')
+  page.wait_for_timeout(1400)
+  st=send(page, {'type':'REQUEST_WRITER_STATE','requestId':'post-hydrate','lease':'L'})
+  assert st['ok'] and st['state']['composerReady'], (st, page.evaluate('window.__h.messages'))
   page.close(); b.close()
 print('Writer browser smoke: PASS')
