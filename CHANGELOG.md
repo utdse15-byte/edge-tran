@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.9 — 2026-07-20
+
+思考强度兼容层(v1)。基于外部《思考强度兼容层最终研究报告》,采纳其核心架构,裁剪其注册表/自动升级/自定义 DSL 部分(理由见 README 与提交说明)。
+
+### 新增(lib/reasoning.js)
+
+- 思考策略:继承接口默认(不发送,老配置零变化)/ 明确关闭 / 手动档位(minimal…max)。
+- 思考参数方言,独立于接口协议:不发送(未知反代安全默认)、OpenAI Chat(顶层 reasoning_effort)、OpenAI Responses(reasoning.effort)、OpenRouter(规范嵌套形式)、DeepSeek(thinking.type + 档位映射 high/max + 思考模式移除采样参数)、通用 thinking.type(GLM 等)、通用 enable_thinking(Qwen 等,仅开关并明示档位不适用)。
+- 构造性不变量:写入前剥离全部已知思考别名 ⇒ 不会同发 reasoning 与 reasoning_effort;关闭时不残留 effort/budget;inherit 不发送任何字段;每请求只有一个控制来源。
+- 严格语义:接口以 400/422 明确拒绝思考参数(error.param 精确匹配)时,报 `reasoning_rejected` 并原样呈现,不进入兼容降级重试(实测网络调用恰一次)、不静默移除、不付费穷举其他字段。
+- 证据(仅非敏感用量):从两种协议的 usage 提取 reasoning_tokens,展示在诊断记录与连通测试结果;思考内容本身不持久化、不进编辑器、不进日志。
+- 设置 UI:策略/方言/档位三个选择 + 本地零费用映射预览(显示将发送/将移除的字段与映射说明);方言列表随接口协议过滤;Provider 摘要显示思考状态。
+- 存储:reasoning 配置随 Provider 规范化(枚举白名单),参与外部窗口变更检测;显式排除在凭据绑定之外——调整思考策略不会使已存 Key 失配。
+
+### 明确不采纳(相对研究报告)
+
+- auto 模式与"验证失败自动升级"状态机:隐性二次计费,审阅门禁已兜底,后续按需求再议。
+- 能力档案注册表(source/confidence/过期/端点指纹)与能力测试按钮:方言预设随扩展版本发布,服务端校验即真相。
+- 自定义路径 DSL 适配器与 Anthropic/Gemini 原生协议:攻击面与复杂度不成比例,留待真实需求。
+- 报告要求的 P0 前置(审阅门禁、数值/语言硬校验、Responses 严格化、暂停代际、还原后长度)已在 v0.2.7/0.2.8 全部完成。
+
+### 测试
+
+- Node 测试 82 → 88 项:各方言 inherit/off/manual 编码与别名剥离、DeepSeek 映射与采样冲突移除、协议不匹配安全跳过、拒绝不重试(恰一次调用)、双协议请求携带与用量提取、存储规范化与凭据绑定不变。
+
 ## 0.2.8 — 2026-07-20
 
 速度优化版。参照 OpenAI 官方延迟优化指南与沉浸式翻译、kiss-translator、openai-translator 等开源项目的通行做法。

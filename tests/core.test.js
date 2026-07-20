@@ -27,6 +27,10 @@ import {
   validateTranslationPayload
 } from "../lib/validation.js";
 import {
+  applyReasoning,
+  normalizeReasoning
+} from "../lib/reasoning.js";
+import {
   backTranslate,
   buildPreviewDisplayText,
   createEnglishStreamExtractor,
@@ -2389,4 +2393,181 @@ test("translateDraft streams the english preview while returning fully validated
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("reasoning layer: inherit and unknown dialects emit nothing and strip stale aliases", () => {
+  const staleBody = {
+    model: "m",
+    messages: [],
+    reasoning: { effort: "high" },
+    reasoning_effort: "high",
+    thinking: { type: "enabled" },
+    enable_thinking: true,
+    thinking_budget: 128,
+    output_config: { effort: "high" }
+  };
+  for (const dialect of ["none", "openai_chat", "openrouter", "deepseek", "thinking_type", "enable_thinking"]) {
+    const resolved = applyReasoning(staleBody, "chat_completions", { dialect, mode: "inherit", effort: "high" });
+    for (const key of ["reasoning", "reasoning_effort", "thinking", "enable_thinking", "thinking_budget", "output_config"]) {
+      assert.equal(key in resolved.body, false, `${dialect}/inherit must not carry ${key}`);
+    }
+  }
+  const noneManual = applyReasoning(staleBody, "chat_completions", { dialect: "none", mode: "manual", effort: "high" });
+  assert.equal("reasoning_effort" in noneManual.body, false);
+  assert.ok(noneManual.notes.length > 0, "manual with dialect none must explain that nothing was sent");
+  const mismatch = applyReasoning({}, "responses", { dialect: "deepseek", mode: "manual", effort: "high" });
+  assert.equal("thinking" in mismatch.body, false);
+  assert.ok(mismatch.notes.some((note) => note.includes("不适用")), mismatch.notes);
+});
+
+test("reasoning layer: off encodings never leave effort or budget behind", () => {
+  const seeded = { reasoning_effort: "high", thinking_budget: 64, reasoning: { effort: "high" } };
+  const chat = applyReasoning(seeded, "chat_completions", { dialect: "openai_chat", mode: "off", effort: "high" });
+  assert.equal(chat.body.reasoning_effort, "none");
+  assert.equal("reasoning" in chat.body, false);
+
+  const router = applyReasoning(seeded, "chat_completions", { dialect: "openrouter", mode: "off", effort: "high" });
+  assert.deepEqual(router.body.reasoning, { effort: "none" });
+  assert.equal("reasoning_effort" in router.body, false);
+
+  for (const dialect of ["deepseek", "thinking_type"]) {
+    const off = applyReasoning(seeded, "chat_completions", { dialect, mode: "off", effort: "max" });
+    assert.deepEqual(off.body.thinking, { type: "disabled" });
+    assert.equal("reasoning_effort" in off.body, false, dialect);
+    assert.equal("thinking_budget" in off.body, false, dialect);
+  }
+
+  const qwen = applyReasoning(seeded, "chat_completions", { dialect: "enable_thinking", mode: "off", effort: "high" });
+  assert.equal(qwen.body.enable_thinking, false);
+  assert.equal("thinking_budget" in qwen.body, false);
+});
+
+test("reasoning layer: manual tiers map per dialect without alias conflicts", () => {
+  const router = applyReasoning({ reasoning_effort: "stale" }, "chat_completions", { dialect: "openrouter", mode: "manual", effort: "medium" });
+  assert.deepEqual(router.body.reasoning, { effort: "medium" });
+  assert.equal("reasoning_effort" in router.body, false, "never both aliases");
+
+  const responses = applyReasoning({}, "responses", { dialect: "openai_responses", mode: "manual", effort: "low" });
+  assert.deepEqual(responses.body.reasoning, { effort: "low" });
+
+  const deepseek = applyReasoning({ temperature: 0, top_p: 1 }, "chat_completions", { dialect: "deepseek", mode: "manual", effort: "low" });
+  assert.deepEqual(deepseek.body.thinking, { type: "enabled" });
+  assert.equal(deepseek.body.reasoning_effort, "high", "DeepSeek maps low tiers up");
+  assert.equal("temperature" in deepseek.body, false, "sampling params conflict with thinking mode");
+  assert.equal("top_p" in deepseek.body, false);
+  assert.equal(applyReasoning({}, "chat_completions", { dialect: "deepseek", mode: "manual", effort: "xhigh" }).body.reasoning_effort, "max");
+
+  const glm = applyReasoning({}, "chat_completions", { dialect: "thinking_type", mode: "manual", effort: "max" });
+  assert.deepEqual(glm.body.thinking, { type: "enabled" });
+  assert.equal(glm.body.reasoning_effort, "max");
+
+  const qwen = applyReasoning({}, "chat_completions", { dialect: "enable_thinking", mode: "manual", effort: "high" });
+  assert.equal(qwen.body.enable_thinking, true);
+  assert.equal("reasoning_effort" in qwen.body, false);
+  assert.equal(qwen.effectiveEffort, null);
+  assert.ok(qwen.notes.some((note) => note.includes("档位")), qwen.notes);
+});
+
+test("reasoning config flows into requests, and rejections never trigger paid retries", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    const requests = [];
+    globalThis.fetch = async (_url, options) => {
+      requests.push(JSON.parse(options.body));
+      return new Response(JSON.stringify({
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }],
+        usage: { completion_tokens_details: { reasoning_tokens: 42 } }
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    };
+    const result = await chatCompletion({
+      config: {
+        baseUrl: "https://provider.example/v1",
+        timeoutMs: 1000,
+        capabilities: { jsonMode: false, temperature: true, streaming: false },
+        reasoning: { dialect: "deepseek", mode: "manual", effort: "low" }
+      },
+      apiKey: "k", model: "m",
+      messages: [{ role: "user", content: "你好" }],
+      preferJson: false
+    });
+    assert.deepEqual(requests[0].thinking, { type: "enabled" });
+    assert.equal(requests[0].reasoning_effort, "high");
+    assert.equal("temperature" in requests[0], false);
+    assert.equal(result.reasoningTokens, 42);
+
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      return new Response(JSON.stringify({
+        error: { message: "Unknown parameter: reasoning_effort", param: "reasoning_effort", code: "unknown_parameter" }
+      }), { status: 400, headers: { "Content-Type": "application/json" } });
+    };
+    await assert.rejects(
+      () => chatCompletion({
+        config: {
+          baseUrl: "https://provider.example/v1",
+          timeoutMs: 1000,
+          capabilities: { jsonMode: null, temperature: null, streaming: false },
+          reasoning: { dialect: "openai_chat", mode: "manual", effort: "high" }
+        },
+        apiKey: "k", model: "m",
+        messages: [{ role: "user", content: "你好" }],
+        preferJson: true
+      }),
+      (error) => error?.code === "reasoning_rejected" && error?.reasoningRejected === true
+    );
+    assert.equal(calls, 1, "a rejected reasoning field must never be silently removed and retried");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("responses protocol carries reasoning fields and reports responses-style usage", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    const requests = [];
+    globalThis.fetch = async (_url, options) => {
+      requests.push(JSON.parse(options.body));
+      return new Response(JSON.stringify({
+        object: "response",
+        status: "completed",
+        usage: { output_tokens_details: { reasoning_tokens: 7 } },
+        output: [{ type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "ok" }] }]
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    };
+    const result = await chatCompletion({
+      config: {
+        baseUrl: "https://provider.example/v1",
+        apiProtocol: "responses",
+        timeoutMs: 1000,
+        capabilities: { jsonMode: false, temperature: false, streaming: false },
+        reasoning: { dialect: "openai_responses", mode: "manual", effort: "low" }
+      },
+      apiKey: "k", model: "m",
+      messages: [{ role: "user", content: "你好" }],
+      preferJson: false
+    });
+    assert.deepEqual(requests[0].reasoning, { effort: "low" });
+    assert.equal(result.reasoningTokens, 7);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("reasoning settings normalize safely and stay out of the credential binding", () => {
+  assert.deepEqual(
+    normalizeReasoning({ dialect: "hack", mode: "yes", effort: "ultra" }),
+    { dialect: "none", mode: "inherit", effort: "low" }
+  );
+  const provider = normalizeStoredProvider({ reasoning: { dialect: "deepseek", mode: "manual", effort: "xhigh" } });
+  assert.deepEqual(provider.reasoning, { dialect: "deepseek", mode: "manual", effort: "xhigh" });
+  assert.deepEqual(normalizeStoredProvider({}).reasoning, { dialect: "none", mode: "inherit", effort: "low" });
+
+  const base = { baseUrl: "https://api.example.com/v1", extraHeaders: {} };
+  const withReasoning = { ...base, reasoning: { dialect: "deepseek", mode: "manual", effort: "max" } };
+  assert.equal(
+    providerCredentialBinding(base),
+    providerCredentialBinding(withReasoning),
+    "changing the thinking policy must not invalidate stored keys"
+  );
 });
