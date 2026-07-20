@@ -295,6 +295,14 @@ async function handlePanelMessage(panel, message) {
         return;
       }
 
+      // Snapshot the ownership tuple before the asynchronous foreground
+      // check. An unbind + rebind during the await would otherwise let this
+      // stale command resume and be stamped with the panel's NEW lease,
+      // executing under an ownership interval it never belonged to.
+      const leaseSnapshot = panel.lease;
+      const boundTabSnapshot = panel.boundTabId;
+      const generationSnapshot = panel.bindGeneration;
+
       if (message.type !== "REQUEST_WRITER_STATE") {
         const active = await isBoundTabActive(panel);
         if (!active) {
@@ -309,9 +317,26 @@ async function handlePanelMessage(panel, message) {
         }
       }
 
+      if (
+        panel.lease !== leaseSnapshot
+        || panel.boundTabId !== boundTabSnapshot
+        || panel.bindGeneration !== generationSnapshot
+        || writers.get(boundTabSnapshot) !== writer
+        || writer.lease !== leaseSnapshot
+      ) {
+        post(panel.port, {
+          type: `${message.type}_RESULT`,
+          requestId: message.requestId,
+          ok: false,
+          code: "target_unavailable",
+          message: "命令等待期间目标绑定已变化，未执行"
+        });
+        return;
+      }
+
       post(writer.port, {
         ...message,
-        lease: panel.lease
+        lease: leaseSnapshot
       });
     }
   }

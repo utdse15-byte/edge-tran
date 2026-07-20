@@ -295,7 +295,7 @@ MOCK_EXTENSION = r"""
     if (/^Translate the English message into natural Simplified Chinese/i.test(system)) {
       window.__mock.backCalls += 1;
       return new Response(JSON.stringify({
-        choices: [{ finish_reason: 'stop', message: { content: `回译：${user}` } }]
+        choices: [{ finish_reason: 'stop', message: { content: `完整中文回译内容：${user}` } }]
       }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
     translationCall += 1;
@@ -426,7 +426,7 @@ def main() -> None:
         page.locator("#translateButton").click()
         page.wait_for_function("document.querySelector('#englishText').value === 'Third version.'", timeout=10000)
         page.wait_for_function("window.__mock.writer.text === 'Third version.'", timeout=10000)
-        page.wait_for_function("document.querySelector('#backText').value === '回译：Third version.'", timeout=10000)
+        page.wait_for_function("document.querySelector('#backText').value === '完整中文回译内容：Third version.'", timeout=10000)
         assert page.evaluate("window.__mock.backCalls") == 2
         assert page.locator("#backBadge").inner_text() == "独立"
 

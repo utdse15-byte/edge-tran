@@ -6,6 +6,7 @@ import {
   chatCompletion,
   endpointUrl,
   filterLikelyTextModels,
+  listModels,
   normalizeBaseUrl,
   permissionPatternForBaseUrl,
   readLimitedText,
@@ -19,6 +20,7 @@ import {
 import {
   buildBackTranslationWarnings,
   buildSoftWarnings,
+  parseChineseNumeralRun,
   parseTranslationJson,
   validateBackTranslationText,
   validateEnglishTranslationText,
@@ -1977,4 +1979,231 @@ test("normalizes the stored api protocol and strips a pasted /responses suffix",
     normalizeBaseUrl("https://api.openai.com/v1/responses"),
     "https://api.openai.com/v1"
   );
+});
+
+test("rejects polarity flips and alternate-numeral corrections", () => {
+  for (const [source, original, interpreted_as] of [
+    ["确认是这个文件", "是", "否"],
+    ["把开状态记录下来", "开", "关"],
+    ["数量偏多一些", "偏多", "偏少"],
+    ["用壹份副本", "壹", "贰"],
+    ["共廿件", "廿", "卅"]
+  ]) {
+    const result = validateTranslationPayload({
+      english: "test",
+      corrections: [{ original, interpreted_as, reason: "model claim" }],
+      ambiguous: []
+    }, source);
+    assert.ok(result.errors.some((item) => item.includes("笔误")), `${original}→${interpreted_as} should be rejected`);
+  }
+});
+
+test("treats mostly-untranslated Chinese as a hard failure", () => {
+  const echo = validateEnglishTranslationText("你好世界", "你好世界 a", []);
+  assert.ok(echo.errors.some((item) => item.includes("复述")), echo);
+  const partial = validateEnglishTranslationText("请检查 API 状态", "请检查 API", []);
+  assert.ok(partial.errors.length > 0, partial);
+  const clean = validateEnglishTranslationText("请检查代码", "Please review the code.", []);
+  assert.deepEqual(clean.errors, []);
+});
+
+test("parses Chinese numerals and warns when translated values diverge", () => {
+  assert.equal(parseChineseNumeralRun("三十"), 30);
+  assert.equal(parseChineseNumeralRun("一千二百"), 1200);
+  assert.equal(parseChineseNumeralRun("五万"), 50000);
+  assert.equal(parseChineseNumeralRun("十三"), 13);
+  assert.equal(parseChineseNumeralRun("第三"), null);
+  const mismatch = buildSoftWarnings("部署三十台服务器", "Deploy fifty servers.");
+  assert.ok(mismatch.some((item) => item.includes("中文数字")), mismatch);
+  const match = buildSoftWarnings("部署三十台服务器", "Deploy 30 servers.");
+  assert.equal(match.some((item) => item.includes("中文数字")), false, match);
+  const ordinaryWords = buildSoftWarnings("我们一起把一样的一定做完", "Let us finish the same thing together.");
+  assert.equal(ordinaryWords.some((item) => item.includes("中文数字")), false, ordinaryWords);
+});
+
+test("rejects token-level back-translations and bidi control characters", () => {
+  const tiny = validateBackTranslationText(
+    "请检查这段代码的整体结构是否合理",
+    "Please review the structure.",
+    "x中"
+  );
+  assert.ok(tiny.errors.some((item) => item.includes("比例过低")), tiny);
+  const bidi = validateTranslationPayload({
+    english: "Delete ‮report.txt‬ now.",
+    corrections: [],
+    ambiguous: []
+  }, "现在删除文件");
+  assert.ok(bidi.errors.some((item) => item.includes("控制字符")), bidi);
+});
+
+test("over-limit correction lists fail and over-limit ambiguities warn", () => {
+  const overflow = validateTranslationPayload({
+    english: "test",
+    corrections: Array.from({ length: 9 }, (_, index) => ({
+      original: `错字${index}`, interpreted_as: `正字${index}`, reason: "claim"
+    })),
+    ambiguous: []
+  }, "一段没有这些片段的原稿");
+  assert.ok(overflow.errors.some((item) => item.includes("笔误")), overflow);
+  const manyAmbiguities = validateTranslationPayload({
+    english: "A perfectly ordinary translation.",
+    corrections: [],
+    ambiguous: Array.from({ length: 7 }, (_, index) => ({
+      fragment: "原稿", reading_used: `读法${index}`, alternatives: []
+    }))
+  }, "原稿");
+  assert.ok(manyAmbiguities.warnings.some((item) => item.includes("显示上限")), manyAmbiguities);
+});
+
+test("responses parsing accepts only completed assistant output", async () => {
+  const originalFetch = globalThis.fetch;
+  const config = {
+    baseUrl: "https://provider.example/v1",
+    apiProtocol: "responses",
+    timeoutMs: 1000,
+    capabilities: { jsonMode: false, temperature: false }
+  };
+  const attempt = () => chatCompletion({
+    config, apiKey: "k", model: "m",
+    messages: [{ role: "user", content: "你好" }],
+    preferJson: false
+  });
+  const respond = (payload) => new Response(JSON.stringify(payload), {
+    status: 200, headers: { "Content-Type": "application/json" }
+  });
+  const goodMessage = { type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "ok" }] };
+
+  try {
+    globalThis.fetch = async () => respond({ object: "response", status: "in_progress", output: [goodMessage] });
+    await assert.rejects(attempt, (error) => error?.code === "incomplete_response");
+
+    globalThis.fetch = async () => respond({ object: "response", status: "completed", output: [{ ...goodMessage, status: "in_progress" }] });
+    await assert.rejects(attempt, (error) => error?.code === "incomplete_response");
+
+    globalThis.fetch = async () => respond({ object: "response", status: "completed", output: [{ ...goodMessage, role: "user" }] });
+    await assert.rejects(attempt, (error) => error?.code === "incomplete_response");
+
+    globalThis.fetch = async () => respond({ object: "not-a-response", output: [goodMessage] });
+    await assert.rejects(attempt, (error) => error?.code === "unsupported_response_schema");
+
+    globalThis.fetch = async () => respond({ object: "response", status: "completed", output: [goodMessage] });
+    const result = await attempt();
+    assert.equal(result.text, "ok");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("chat parsing allowlists finish reasons and drops the legacy text fallback", async () => {
+  const originalFetch = globalThis.fetch;
+  const config = {
+    baseUrl: "https://provider.example/v1",
+    timeoutMs: 1000,
+    capabilities: { jsonMode: false, temperature: false }
+  };
+  const attempt = () => chatCompletion({
+    config, apiKey: "k", model: "m",
+    messages: [{ role: "user", content: "你好" }],
+    preferJson: false
+  });
+  const respond = (payload) => new Response(JSON.stringify(payload), {
+    status: 200, headers: { "Content-Type": "application/json" }
+  });
+
+  try {
+    globalThis.fetch = async () => respond({
+      choices: [{ finish_reason: "mystery_reason", message: { role: "assistant", content: "hello" } }]
+    });
+    await assert.rejects(attempt, (error) => error?.code === "incomplete_response");
+
+    globalThis.fetch = async () => respond({
+      choices: [{ finish_reason: "stop", message: { role: "user", content: "hello" } }]
+    });
+    await assert.rejects(attempt, (error) => error?.code === "incomplete_response");
+
+    globalThis.fetch = async () => respond({
+      choices: [{ finish_reason: "stop", text: "legacy completions text" }]
+    });
+    await assert.rejects(attempt, (error) => error?.code === "empty_assistant_content");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("model list requires a recognized envelope and unrelated text params do not degrade JSON mode", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => new Response(JSON.stringify({ login: "required" }), {
+      status: 200, headers: { "Content-Type": "application/json" }
+    });
+    await assert.rejects(
+      () => listModels({
+        config: { baseUrl: "https://provider.example/v1", timeoutMs: 1000 },
+        apiKey: "k"
+      }),
+      (error) => error?.code === "unsupported_response_schema"
+    );
+
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ error: { message: "text is invalid here", param: "text" } }), {
+        status: 400, headers: { "Content-Type": "application/json" }
+      });
+    };
+    await assert.rejects(() => chatCompletion({
+      config: { baseUrl: "https://provider.example/v1", timeoutMs: 1000, capabilities: { jsonMode: null, temperature: null } },
+      apiKey: "k", model: "m",
+      messages: [{ role: "user", content: "你好" }],
+      preferJson: true
+    }));
+    assert.equal(calls, 1, "an unrelated param 'text' must not trigger a paid degradation retry");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("secret-like extra headers are stripped while routing headers survive", () => {
+  const sanitized = sanitizeExtraHeaders({
+    "X-Access-Key": "a", "X-Subscription-Key": "b", "X-Credential": "c",
+    "X-Auth": "d", "X-Signature": "e", "X-Session-Id": "f",
+    "X-Project": "keepme", "X-Api-Version": "2024", "X-Request-Source": "panel"
+  });
+  assert.deepEqual(Object.keys(sanitized).sort(), ["X-Api-Version", "X-Project", "X-Request-Source"]);
+});
+
+test("variable-length fences, overlapping terms and expanded path forms are protected", () => {
+  const fenced = "````\ncode with ``` inside\nstill code\n````\n之后的中文";
+  const fencedResult = protectText(fenced, []);
+  assert.equal(fencedResult.placeholders[0].value.includes("still code"), true, fencedResult.placeholders);
+  assert.equal(fencedResult.protectedText.includes("still code"), false);
+
+  const inline = "运行 ``a`b`` 命令";
+  const inlineResult = protectText(inline, []);
+  assert.ok(inlineResult.placeholders.some((item) => item.value === "``a`b``"), inlineResult.placeholders);
+
+  const overlapping = protectText("ababa", ["aba"]);
+  assert.equal(overlapping.placeholders.length, 1);
+  assert.equal(overlapping.placeholders[0].start, 0);
+
+  const paths = protectText("路径：/tmp/file 与 path=/var/log 以及 ~/project/main.js 和 $HOME/bin/tool", []);
+  const values = paths.placeholders.map((item) => item.value);
+  assert.ok(values.includes("/tmp/file"), values);
+  assert.ok(values.includes("/var/log"), values);
+  assert.ok(values.includes("~/project/main.js"), values);
+  assert.ok(values.includes("$HOME/bin/tool"), values);
+
+  const restored = restorePlaceholders(fencedResult.protectedText, fencedResult.placeholders);
+  assert.equal(restored, fenced);
+});
+
+test("protected terms deduplicate before the cap is applied", () => {
+  const noisy = [
+    ...Array.from({ length: 500 }, () => "  重复词  "),
+    "尾部真词"
+  ];
+  const result = protectText("原稿包含 尾部真词 和 重复词", noisy);
+  const values = result.placeholders.map((item) => item.value);
+  assert.ok(values.includes("尾部真词"), values);
+  assert.ok(values.includes("重复词"), values);
 });

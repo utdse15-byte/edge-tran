@@ -565,6 +565,7 @@ function showManualBanner(text) {
   state.manualText = String(text ?? "");
   state.targetPhase = "manual";
   state.paused = true;
+  state.pausedByTargetLoss = false;
   ui.manualBanner.classList.remove("hidden");
   setStatus("检测到人工修改，自动覆盖已暂停", "paused");
   updateDraftUI();
@@ -876,6 +877,7 @@ function scheduleExternalConfigurationReload(reasons) {
         backTranslationMode: normalizeBackTranslationMode(settings.backTranslationMode)
       };
       state.paused = true;
+      state.pausedByTargetLoss = false;
       state.externalConfigurationChanged = true;
       state.formCapabilitySignature = null;
       state.formCapabilities = null;
@@ -892,6 +894,7 @@ function scheduleExternalConfigurationReload(reasons) {
       invalidateFormRequests();
       invalidateRuntimeContext();
       state.paused = true;
+      state.pausedByTargetLoss = false;
       setStatus("检测到配置变化，但重新读取失败；自动流程已暂停", "error");
       addDiagnostic(`外部配置变化后读取失败：${String(error?.message || "storage_error").slice(0, 120)}`);
     }
@@ -920,7 +923,7 @@ function providerErrorMessage(error) {
     case "network_error":
       return "无法连接 Provider";
     case "endpoint_not_found":
-      return "Base URL 或 Chat Completions 路径不正确";
+      return "Base URL 或接口路径不正确；请核对所选“接口协议”对应的端点（/chat/completions 或 /responses）";
     case "model_not_found":
       return "模型不存在、不可用，或当前 API Key 无权访问";
     case "incompatible_request":
@@ -1234,6 +1237,7 @@ function handlePanelMessage(message) {
       if (message.ok) {
         abortInFlight();
         state.paused = true;
+        state.pausedByTargetLoss = false;
         state.target.writerSession = message.writerSession ?? state.target.writerSession;
         state.target.targetEpoch = message.targetEpoch ?? state.target.targetEpoch + 1;
         state.target.pluginOwned = true;
@@ -1279,6 +1283,7 @@ function handlePanelMessage(message) {
     case "TARGET_CLEARED":
       abortInFlight();
       state.paused = true;
+      state.pausedByTargetLoss = false;
       state.target.targetEpoch = message.targetEpoch ?? state.target.targetEpoch + 1;
       state.target.pluginOwned = false;
       state.target.currentText = "";
@@ -1365,7 +1370,10 @@ function handlePanelMessage(message) {
     case "TARGET_TAKEN":
       abortInFlight();
       // Remember whether this pause is newly caused by a recoverable
-      // connection loss. A user-initiated pause must never auto-resume.
+      // connection loss. A user-initiated pause — or any other pause reason,
+      // every one of which resets this flag — must never auto-resume: a stale
+      // flag surviving into an unrelated pause (e.g. external configuration
+      // review) would let a later successful rebind cancel that pause.
       state.pausedByTargetLoss = !state.paused
         && message.type === "TARGET_UNAVAILABLE"
         && Boolean(message.recoverable);
@@ -1538,6 +1546,7 @@ async function clearStaleTargetOwned({
       state.target.pluginOwned = false;
       state.targetPhase = "manual";
       state.paused = true;
+      state.pausedByTargetLoss = false;
       bannerMessage = "清理过程中 Claude 输入框发生变化，自动覆盖已停止；请人工核对当前内容。";
       addDiagnostic(`旧译文清理被中断或回滚失败：${result.code}`);
       void requestWriter("REQUEST_WRITER_STATE", {});
@@ -1756,6 +1765,26 @@ async function translateNow({ forceSync = false, forceOverwrite = false, reason 
     );
     schedulePersist();
     updateDraftUI();
+
+    // Review gate: corrections, ambiguities and quantity/echo warnings are
+    // approvals to obtain, not notifications to file after the fact. With any
+    // of them pending, the English stays in the preview and the user's own
+    // 同步到 Claude click is the explicit approval that releases it.
+    const reviewRequired = result.corrections.length > 0
+      || result.ambiguities.length > 0
+      || result.warnings.some((warning) => /数字|复述|回答式|语序/.test(warning));
+    if (reviewRequired) {
+      state.targetPhase = "ready";
+      setStatus("翻译完成，但存在需人工确认的纠错/歧义/数量提示；请核对后点“同步到 Claude”", "paused");
+      updateDraftUI();
+      if (providerContext.backTranslationMode === BACK_TRANSLATION_MODES.INDEPENDENT) {
+        scheduleBackTranslation(revision, result.english, providerContext, {
+          kind: "independent",
+          useDelay: true
+        });
+      }
+      return;
+    }
 
     const shouldSync = forceSync || providerContext.settings.autoSync;
     if (shouldSync) {
@@ -2045,6 +2074,7 @@ async function syncEnglishNow({
     state.target.targetEpoch = resultEpoch ?? state.target.targetEpoch;
     state.target.pluginOwned = false;
     state.paused = true;
+    state.pausedByTargetLoss = false;
     state.targetPhase = "manual";
     setStatus("写入被中断或未能完整恢复，请人工核对 Claude 输入框", "error");
     void requestWriter("REQUEST_WRITER_STATE", {});
@@ -2302,6 +2332,7 @@ async function archiveUncertainSend(sentText, details = {}) {
   }
 
   state.paused = true;
+  state.pausedByTargetLoss = false;
   state.targetPhase = "empty";
   state.draft.warnings = [...new Set([
     ...state.draft.warnings,
@@ -2367,6 +2398,7 @@ async function clearCurrentDraft() {
     updateDraftUI({ preserveSourceSelection: false });
   } else {
     state.paused = true;
+    state.pausedByTargetLoss = false;
     state.targetPhase = "stale-uncleared";
     hideManualBanner();
     setStatus("侧栏草稿已清空，但 Claude 中仍保留旧英文", "error");
@@ -2841,6 +2873,7 @@ function renderHistory() {
         model: item.model
       });
       state.paused = true;
+      state.pausedByTargetLoss = false;
       state.translatePhase = "idle";
       state.backPhase = state.draft.backTranslation
         ? "ready"
@@ -3018,6 +3051,7 @@ async function diagnosticClear() {
 
 async function keepManualVersion() {
   state.paused = true;
+  state.pausedByTargetLoss = false;
   state.targetPhase = "manual";
   hideManualBanner();
   setStatus("已保留 Claude 中的人工英文；自动同步保持暂停", "paused");
@@ -3065,6 +3099,7 @@ async function useManualAsBaseline() {
   state.backPhase = backMode === BACK_TRANSLATION_MODES.OFF ? "off" : "idle";
   state.targetPhase = "manual";
   state.paused = true;
+  state.pausedByTargetLoss = false;
   hideManualBanner();
   schedulePersist();
   updateDraftUI();

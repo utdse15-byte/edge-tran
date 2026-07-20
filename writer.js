@@ -360,6 +360,18 @@
       for (const node of scope.querySelectorAll('[data-attachment], [data-file-id], [data-testid*="attachment" i]')) {
         if (!element.contains(node)) return node;
       }
+      // Attachment chips labelled only through accessibility attributes must
+      // fail closed too. Interactive controls are excluded: an "添加附件"
+      // toolbar button carries the same words and must not permanently
+      // disable writes.
+      for (const node of scope.querySelectorAll(
+        '[aria-label*="attachment" i], [aria-label*="attached" i], [aria-label*="附件"], [aria-label*="文件"]'
+      )) {
+        if (element.contains(node)) continue;
+        if (!(node instanceof HTMLElement)) continue;
+        if (node.closest('button, [role="button"], input, select, textarea, a[href]')) continue;
+        return node;
+      }
       scope = scope.parentElement;
     }
     return null;
@@ -981,9 +993,12 @@
         if (locateComposer()) scheduleEnsureComposer();
         return;
       }
-      if (!composer.isConnected || !isEditableCandidate(composer)) {
-        scheduleEnsureComposer();
-      }
+      // A connected, still-valid composer can also be superseded by a better
+      // candidate through attribute-only hydration (e.g. the real main
+      // composer gaining its labels while an early/inline editor remains).
+      // ensureComposer handles the re-ranking with its +60 hysteresis and is
+      // a no-op when nothing changed, so schedule it unconditionally.
+      scheduleEnsureComposer();
     }, COMPOSER_SCAN_INTERVAL_MS);
     bindComposer(locateComposer(), "attached");
   }
@@ -1405,6 +1420,14 @@
     }
     if (!composer?.isConnected) {
       rejectResult(resultType, message.requestId, "composer_missing", "未找到 Claude 输入框");
+      return false;
+    }
+    // Programmatic setters would happily mutate a hidden, disabled or
+    // read-only control. Re-run the full editability predicate at command
+    // time instead of trusting the state captured when the composer was
+    // located.
+    if (!isEditableCandidate(composer)) {
+      rejectResult(resultType, message.requestId, "composer_not_editable", "Claude 输入框当前不可见或不可编辑");
       return false;
     }
     if (message.expectedWriterSession && message.expectedWriterSession !== writerSession) {
