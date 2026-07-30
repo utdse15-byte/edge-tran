@@ -26,7 +26,7 @@ globalThis.fetch = async () => new Response(JSON.stringify({ choices: [...] }), 
 
 | 层 | 载体 | 覆盖 |
 | --- | --- | --- |
-| 传输/翻译管线 | `tests/e2e-provider.test.js`（93 项，`npm test`） | `lib/translator.js` + `lib/provider.js` 直接打真实 socket |
+| 传输/翻译管线 | `tests/e2e-provider.test.js`（99 项，`npm test`） | `lib/translator.js` + `lib/provider.js` 直接打真实 socket |
 | 真实 UI 全链路 | `scripts/panel-live-provider-test.py`（`npm run verify:full`） | Chromium 里跑真实 `panel.js` → 真实 HTTP → 真实 writer 链路 |
 | 人工联调 | `npm run mock:provider` | 侧载真实扩展，Base URL 指向本地网关（见 TESTING.md 场景表） |
 
@@ -42,6 +42,7 @@ globalThis.fetch = async () => new Response(JSON.stringify({ choices: [...] }), 
 | 4 | 三个可降级字段只有两次降级预算 | 中 | 逐项拒绝 `response_format`/`temperature`/`stream` 的网关永远无法被满足，且不提示"关掉流式预览" | `/worst_case/v1` |
 | 5 | 标错 `text/event-stream` 的 JSON 响应白白失败 | 低 | 对所有响应一律标 SSE 的网关；正文其实已在内存里 | `/sse_content_type_json_body/v1` |
 | 6 | 丢失的流式事件被算到模型头上 | 中 | 中间丢一个 delta，流仍以 `finish_reason: stop` 收尾 → 报"模型可能复述了原稿"并多花一次修复请求 | `/sse_dropped_event/v1` |
+| 7 | 信息性状态覆盖掉更新更重要的错误 | 低 | 另一窗口清除/轮换 Key 的同时用户点翻译：错误被"已采纳另一个窗口的配置修改，自动流程继续"盖掉，状态栏与实际结果不符 | 见 panel-live-provider 步骤 5m |
 
 配套的工程问题（同样修复）：
 
@@ -83,7 +84,7 @@ globalThis.fetch = async () => new Response(JSON.stringify({ choices: [...] }), 
 ## 如何重跑
 
 ```
-npm run verify        # 语法（含 .mjs）+ 185 项 Node 测试 + 静态审计
+npm run verify        # 语法（含 .mjs）+ 191 项 Node 测试 + 静态审计
 npm run verify:full   # 追加 5 个 Chromium 套件（含 panel-live-provider）
 npm run mock:provider # 人工联调：把扩展 Base URL 指向 http://127.0.0.1:8787/<scenario>/v1
 ```

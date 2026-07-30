@@ -665,6 +665,38 @@ scenario("many_models", (ctx) => {
   return ok(ctx);
 });
 
+// Fields a conformant OpenAI-compatible gateway is expected to understand.
+// Anything else in the body is rejected the way strict relays and Azure-style
+// deployments do ("Unrecognized request argument supplied: …").
+const KNOWN_CHAT_FIELDS = new Set([
+  "model", "messages", "stream", "stream_options", "response_format", "temperature",
+  "top_p", "max_tokens", "max_completion_tokens", "n", "stop", "presence_penalty",
+  "frequency_penalty", "seed", "user", "logprobs", "tools", "tool_choice"
+]);
+const KNOWN_RESPONSES_FIELDS = new Set([
+  "model", "input", "instructions", "stream", "store", "text", "temperature",
+  "top_p", "max_output_tokens", "metadata", "tools", "tool_choice", "include",
+  "previous_response_id", "truncation", "user"
+]);
+
+scenario("strict_schema", (ctx) => {
+  const known = ctx.protocol === "responses" ? KNOWN_RESPONSES_FIELDS : KNOWN_CHAT_FIELDS;
+  const unknown = Object.keys(ctx.rawBody ? JSON.parse(ctx.rawBody) : {}).filter(
+    (key) => !known.has(key)
+  );
+  if (unknown.length > 0) {
+    return json(ctx.res, 400, {
+      error: {
+        message: `Unrecognized request argument supplied: ${unknown.join(", ")}`,
+        type: "invalid_request_error",
+        param: unknown[0],
+        code: "unknown_parameter"
+      }
+    });
+  }
+  return ok(ctx);
+});
+
 scenario("strict_accept", (ctx) => {
   // A gateway that performs real content negotiation. A streaming request that
   // advertises only `Accept: application/json` is refused with 406.
@@ -850,6 +882,15 @@ scenario("payload_too_large", (ctx) => json(ctx.res, 413, {
 scenario("redirect", (ctx) => {
   ctx.res.writeHead(302, { Location: "/v1/chat/completions", "Content-Length": "0" });
   ctx.res.end();
+});
+
+scenario("slow_once", async (ctx) => {
+  // Only the first request is slow. Used to drive the stale-response race: the
+  // user edits the draft while request #1 is still in flight, and #1's answer
+  // must never reach the composer.
+  ctx.state.count = (ctx.state.count ?? 0) + 1;
+  if (ctx.state.count === 1) await sleep(1200);
+  return ok(ctx);
 });
 
 scenario("slow", async (ctx) => {

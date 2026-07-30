@@ -19,6 +19,7 @@ import {
 import {
   filterLikelyTextModels,
   listModels,
+  normalizeBaseUrl,
   ProviderError
 } from "../lib/provider.js";
 import { BACK_TRANSLATION_MODES } from "../lib/shared.js";
@@ -992,6 +993,144 @@ test("a model list failure does not block a manually typed model id", async () =
   await expectProviderError(listModels({ config: config("models_missing"), apiKey: KEY }), { status: 404 });
   const result = await translate("models_missing");
   assert.ok(result.english);
+});
+
+// ---------------------------------------------------------------------------
+// Misconfiguration: fail before spending money
+// ---------------------------------------------------------------------------
+
+test("non-HTTP(S) and credential-bearing Base URLs are refused", async () => {
+  for (const value of [
+    "javascript:alert(1)",
+    "data:text/plain,hi",
+    "file:///etc/passwd",
+    "ftp://api.example.com/v1",
+    "https://user:pass@api.example.com/v1",
+    "http://api.example.com/v1"
+  ]) {
+    assert.throws(() => normalizeBaseUrl(value), undefined, `accepted ${value}`);
+  }
+  // Local HTTP stays allowed for self-hosted gateways.
+  assert.equal(normalizeBaseUrl("http://127.0.0.1:8787/v1"), "http://127.0.0.1:8787/v1");
+});
+
+test("a malformed credential or model fails before any request is sent", async () => {
+  const cases = [
+    ["key with a newline", { apiKey: "sk-abc\ndef" }],
+    ["key with a tab", { apiKey: "sk-abc\tdef" }],
+    ["non-Latin-1 key", { apiKey: "密钥" }],
+    ["over-long key", { apiKey: "s".repeat(8193) }],
+    ["empty model", { model: "" }],
+    ["over-long model", { model: "m".repeat(300) }],
+    ["auth header Content-Type", { configExtra: { authHeader: "Content-Type" } }],
+    ["auth header Cookie", { configExtra: { authHeader: "Cookie" } }],
+    ["auth header __proto__", { configExtra: { authHeader: "__proto__" } }],
+    ["auth header with a space", { configExtra: { authHeader: "X Api Key" } }],
+    ["non-Latin-1 auth prefix", { configExtra: { authPrefix: "令牌" } }],
+    ["over-long auth prefix", { configExtra: { authPrefix: "p".repeat(200) } }]
+  ];
+  for (const [label, override] of cases) {
+    mock.reset();
+    await expectFailure(translateDraft({
+      source: SOURCE,
+      config: config("ok", override.configExtra),
+      apiKey: override.apiKey ?? KEY,
+      model: override.model ?? MODEL
+    }));
+    assert.equal(chatRequests().length, 0, `${label} reached the network`);
+  }
+});
+
+test("an unreachable gateway is a network error on both endpoints", async () => {
+  // Bind a port, then release it, so the address is guaranteed to refuse.
+  const doomed = await startMockProvider({ port: 0 });
+  const port = doomed.port;
+  await doomed.close();
+  const unreachable = { ...config("ok"), baseUrl: `http://127.0.0.1:${port}/v1` };
+
+  await expectProviderError(
+    translateDraft({ source: SOURCE, config: unreachable, apiKey: KEY, model: MODEL }),
+    { code: "network_error" }
+  );
+  await expectProviderError(
+    listModels({ config: unreachable, apiKey: KEY }),
+    { code: "network_error" }
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Request-shaping matrix
+// ---------------------------------------------------------------------------
+
+const REASONING_FIELD_NAMES = [
+  "reasoning", "reasoning_effort", "thinking", "enable_thinking",
+  "thinking_budget", "output_config"
+];
+
+test("the default configuration survives a gateway that rejects unknown fields", async () => {
+  // A strict relay answers any unrecognised body field with 400. The shipped
+  // default (reasoning inherit + dialect none) must never trip that, across
+  // both protocols, both transports and all three back-translation modes.
+  for (const apiProtocol of ["chat_completions", "responses"]) {
+    for (const streaming of [false, true]) {
+      for (const backTranslationMode of Object.values(BACK_TRANSLATION_MODES)) {
+        mock.reset();
+        const result = await translate("strict_schema", {
+          configExtra: { apiProtocol },
+          backTranslationMode,
+          onEnglishPreview: streaming ? () => {} : null
+        });
+        assert.ok(
+          result.english,
+          `${apiProtocol}/${streaming ? "sse" : "buffered"}/${backTranslationMode} was rejected`
+        );
+      }
+    }
+  }
+});
+
+test("every reasoning dialect emits exactly its own fields, or nothing", async () => {
+  // inherit, dialect "none", and a dialect that does not apply to the active
+  // protocol must all send zero thinking fields. Anything else must send at
+  // least one — silently sending nothing would make an explicit user choice a
+  // no-op, which is the failure mode lib/reasoning.js exists to prevent.
+  const dialects = [
+    "none", "openai_chat", "openai_responses", "openrouter",
+    "deepseek", "thinking_type", "enable_thinking"
+  ];
+  for (const apiProtocol of ["chat_completions", "responses"]) {
+    const applicable = apiProtocol === "responses"
+      ? ["none", "openai_responses"]
+      : ["none", "openai_chat", "openrouter", "deepseek", "thinking_type", "enable_thinking"];
+    for (const mode of ["inherit", "off", "manual"]) {
+      for (const dialect of dialects) {
+        mock.reset();
+        await translate("ok", {
+          configExtra: { apiProtocol, reasoning: { dialect, mode, effort: "high" } }
+        });
+        const body = chatRequests()[0].body;
+        const emitted = REASONING_FIELD_NAMES.filter((field) => field in body);
+        const shouldBeSilent = mode === "inherit"
+          || dialect === "none"
+          || !applicable.includes(dialect);
+        const label = `${apiProtocol}/${mode}+${dialect}`;
+        if (shouldBeSilent) {
+          assert.deepEqual(emitted, [], `${label} must send no thinking fields`);
+        } else {
+          assert.ok(emitted.length > 0, `${label} sent nothing, the setting was a no-op`);
+        }
+      }
+    }
+  }
+});
+
+test("the deepseek dialect drops sampling parameters it documents as ignored", async () => {
+  await translate("ok", {
+    configExtra: { reasoning: { dialect: "deepseek", mode: "manual", effort: "high" } }
+  });
+  const body = chatRequests()[0].body;
+  assert.deepEqual(body.thinking, { type: "enabled" });
+  assert.equal("temperature" in body, false, "temperature must not ride along in thinking mode");
 });
 
 // ---------------------------------------------------------------------------

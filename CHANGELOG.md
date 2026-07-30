@@ -2,7 +2,7 @@
 
 ## 0.2.14 — 2026-07-30
 
-真实网关联调修复版。此前所有 Provider 测试都靠替换 `globalThis.fetch` 用手写 `Response` 断言,**从未经过真实 HTTP 传输**:分块传输、跨 TCP 包切断的 SSE 事件、切在多字节字符中间的 UTF-8、内容协商、Content-Encoding、重定向、僵死连接、以及"客户端取消流服务端是否感知"全部在覆盖范围之外。本版新增一个自带的 OpenAI 兼容网关模拟器(`scripts/mock-provider.mjs`,112 个场景),让扩展在真实 socket 上跑起来,由此定位并修复 6 个传输层缺陷。
+真实网关联调修复版。此前所有 Provider 测试都靠替换 `globalThis.fetch` 用手写 `Response` 断言,**从未经过真实 HTTP 传输**:分块传输、跨 TCP 包切断的 SSE 事件、切在多字节字符中间的 UTF-8、内容协商、Content-Encoding、重定向、僵死连接、以及"客户端取消流服务端是否感知"全部在覆盖范围之外。本版新增一个自带的 OpenAI 兼容网关模拟器(`scripts/mock-provider.mjs`,112 个场景),让扩展在真实 socket 上跑起来,由此定位并修复 6 个传输层缺陷,以及 1 个状态栏竞态。
 
 ### ① 流式请求的 Accept 头不正确(修复)
 
@@ -37,7 +37,7 @@
 ### 工具与测试
 
 - **新增 `scripts/mock-provider.mjs`**:零依赖的 OpenAI 兼容网关模拟器,实现 `/v1/chat/completions`(缓冲 + SSE)、`/v1/responses`(缓冲 + SSE)、`/v1/models`,内置确定性词典翻译模型(遵守 english / back_translation / corrections / ambiguous 契约与占位符规则)。112 个场景各自是一个 Base URL(`http://127.0.0.1:8787/<scenario>/v1`):限流、5xx、nginx HTML、登录页、GBK、gzip、BOM、重定向、socket reset、僵死流、逐字节 SSE、切在多字节字符中间、CRLF + 注释心跳、pretty-print 多行 data、丢事件、超限响应、逐项参数拒绝、思考字段拒绝、协议错配、占位符破坏、越界纠错……`npm run mock:provider` 可直接给真实扩展当本地网关手动联调。
-- **新增 `tests/e2e-provider.test.js`(93 项)**:全部经真实 socket 驱动 `lib/translator.js` + `lib/provider.js`。
+- **新增 `tests/e2e-provider.test.js`(99 项)**:全部经真实 socket 驱动 `lib/translator.js` + `lib/provider.js`。
 - **新增 `scripts/panel-live-provider-test.py`**:Chromium 里跑真实 `panel.js`,通过真实 HTTP 打到本地网关,再经真实 writer 链路写入。覆盖流式预览增量落到 UI、限流不写入、丢包文案不冤枉模型、运行期降级不被持久化、SSE 路由故障的连通测试诊断、评审提醒渲染、模型探测,以及**计费行为**:连打一串键只产生 1 次付费请求、重复翻译同一稿 +0、只加尾随空格 +0(服务端计数核对)。
 - `npm run check` 此前只检查 `.js`,`.mjs` 被整体跳过(包括 `scripts/audit.mjs` 自己);现已纳入。
 - 四个浏览器套件里有两个把 Chromium 路径硬编码成 `/usr/bin/chromium`,`CHROMIUM_PATH` 只在另外两个生效——非 Debian 环境下 `verify:full` 直接跑不起来。现已统一支持环境变量并自动探测常见路径。
@@ -45,11 +45,19 @@
 - 审计新增 0.2.14 传输不变量锚点(流式 Accept、`streamedDeltaText`、`stream_event_lost`、`chatUsage`)。
 - 新增畸形响应扫描:19 种畸形正文逐一验证只会产出 ProviderError / TranslationValidationError,不会有裸 `TypeError` 冒到面板;响应正文中的 `__proto__` 不能污染 `Object.prototype`。
 - 真实 UI 上新增中文输入链路场景:IME 组词全程只 1 次付费请求且发的是完整句子、瞬时 500 自动重试一次即恢复、粘贴 65,000 字超限草稿 0 次付费请求且原文全量保留。
+- 新增请求成形矩阵扫描:协议 × 流式 × 回译档 × 思考策略 × 方言 共 252 种组合逐一核对——出厂默认(继承 + 不发送)在"拒绝任何未知字段"的严格网关上全部通过;每种方言只发它自己那几个字段,不适用于当前协议时一个都不发;deepseek 方言按文档移除采样参数。
+- 新增首次使用与错配扫描:`javascript:`/`data:`/`file:`/`ftp:`/带口令/明文 http 远程 Base URL 全部拒绝;Key 含换行/制表符/非 Latin-1/超长、模型为空或超长、鉴权 Header 名非法等 12 种情形**一次网络请求都不发**;网关不可达在翻译与 `/models` 上都是 `network_error`;空草稿与未配置 Key 在真实 UI 上都是 0 次付费请求。
+- 新增真实 UI 竞态场景:被取代的旧译文永不落到输入框或预览;在途请求遇到另一窗口轮换 Provider 立即作废;Responses 协议 + 独立回译两次请求都打 `/responses` 且第二次不含中文原稿;连续 7 次网关失败后 Key 不出现在诊断/状态栏/DOM/存储任何一处;存储配额写失败时如实报"未能保存"且草稿不丢。
 
 ### 计费透明度与错误可读性(补充改进)
 
 - **本次翻译实际发出几次请求现在会显示**。兼容降级与 JSON 格式重试此前完全不可见:一次翻译可能悄悄花掉 3 次付费请求而界面上毫无痕迹。`translateDraft` / `backTranslate` 现在返回 `requestCount`,超过 1 次时写入诊断日志;连通测试的"通过"行也会标注本次测试实际花了几次请求(包含独立回译),这样"这个网关每次都要两步降级"在正式使用前就能看见。
 - **连通测试不再吞掉本地预检的原因**。`testTranslationConnection` 此前把所有非 ProviderError 一律压成一句"连接测试失败";鉴权 Header 名非法、鉴权前缀含非 Latin-1 字符这类**请求都还没发出**的失败,唯一可行动的那句话就此丢失。现在保留原因:"连接测试失败:…"。
+
+### ⑦ 信息性状态覆盖掉更新更重要的错误(修复)
+
+- `scheduleExternalConfigurationReload` 有 80ms 防抖、之后还要 `await` 一次存储读取。用户完全可以在这个窗口里做事——比如另一个 Edge 窗口刚清除/轮换了 Key,当前窗口点"翻译并同步"得到"请先配置 API Key"。此时那条**纯信息性**的"已采纳另一个窗口的配置修改,自动流程继续"随后落地,把错误状态整条盖掉:状态栏宣称自动流程在继续,实际这次翻译已经中止,唯一线索只剩设置弹窗被打开了。同一个窗口里的限流冷却提示、写入事故提示也会被同样盖掉。
+- 修复:`setStatus` 增加单调计数器;外部配置通知在**排期时刻**取快照,落地时若发现期间有更新的状态就不再覆盖(采纳事实照旧写入诊断日志,信息不丢)。重新读取失败那条 `error` 状态仍然无条件生效——它伴随暂停,属于必须让用户看到的。
 
 ### 复核确认无问题的行为(不改动)
 

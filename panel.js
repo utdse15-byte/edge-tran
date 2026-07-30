@@ -225,6 +225,7 @@ const state = {
   lastInputAt: 0,
   literalFragments: new Set(),
   statusText: "准备就绪",
+  statusSequence: 0,
   translatePhase: "idle",
   backPhase: "idle",
   targetPhase: "unbound",
@@ -298,6 +299,9 @@ function postBindRequest(tabId) {
 
 function setStatus(text, phase = null) {
   state.statusText = String(text);
+  // Monotonic counter so a deferred informational notice can tell whether
+  // anything newer has been said while it was waiting on storage.
+  state.statusSequence += 1;
   if (phase) state.translatePhase = phase;
   ui.statusBar.textContent = state.statusText;
 }
@@ -960,6 +964,12 @@ function relevantStorageChanges(changes, areaName) {
 function scheduleExternalConfigurationReload(reasons) {
   for (const reason of reasons) state.externalStorageReasons.add(reason);
   if (state.externalStorageReloadTimer) clearTimeout(state.externalStorageReloadTimer);
+  // This notice is debounced and then waits on a storage read, so the user can
+  // act inside that window — clicking 翻译并同步 with no Key, hitting a
+  // cooldown, or triggering a write incident. Those messages are newer AND more
+  // important, and an unconditional "自动流程继续" used to overwrite them,
+  // leaving the status bar claiming everything is fine while the action failed.
+  const statusAtSchedule = state.statusSequence;
   state.externalStorageReloadTimer = setTimeout(async () => {
     state.externalStorageReloadTimer = null;
     const reasonList = [...state.externalStorageReasons];
@@ -983,6 +993,8 @@ function scheduleExternalConfigurationReload(reasons) {
       state.externalConfigurationChanged = true;
       state.formCapabilitySignature = null;
       state.formCapabilities = null;
+      // Sampled before the render calls below, which may set their own status.
+      const statusMovedOn = state.statusSequence !== statusAtSchedule;
       ui.automationMode.value = state.settings.automationMode ?? "auto_sync";
       updateProviderSummary();
       updateBackOutputPresentation();
@@ -990,7 +1002,11 @@ function scheduleExternalConfigurationReload(reasons) {
       if (ui.settingsDialog.open) {
         ui.providerTestResult.textContent = "另一个 Edge 窗口修改了 Provider、Key 或翻译设置；当前表单可能已过期，请关闭后重新打开，或明确确认覆盖。";
       }
-      setStatus("已采纳另一个窗口的配置修改，自动流程继续", "idle");
+      // Purely informational: never clobber a newer message. The adoption is
+      // still recorded in the diagnostic log below, so nothing is lost.
+      if (!statusMovedOn) {
+        setStatus("已采纳另一个窗口的配置修改，自动流程继续", "idle");
+      }
       addDiagnostic(`检测到外部配置变化（${reasonList.join("、")}），已采纳新配置并继续`);
       scheduleTranslation();
     } catch (error) {

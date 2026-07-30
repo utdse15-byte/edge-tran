@@ -462,6 +462,230 @@ def main() -> None:
         )
         page.close()
 
+        # --- 5h. a late answer for a superseded draft never lands -----------
+        gateway.reset()
+        page, errors = open_panel(
+            browser, harness, extension_mock(harness, gateway.base_url("slow_once"))
+        )
+        bind_target(page)
+        set_source(page, "请帮我修复部署失败的日志。")
+        translate_now(page)
+        page.wait_for_timeout(150)  # request #1 in flight, deliberately slow
+        set_source(page, "请帮我检查这段代码的性能问题。")
+        translate_now(page)
+        page.wait_for_function(
+            "window.__mock.writer.text.includes('please help me review this snippet')",
+            timeout=20000,
+        )
+        page.wait_for_timeout(1600)  # long enough for request #1 to come back
+        composer = page.evaluate("window.__mock.writer.text")
+        assert "deploy" not in composer, f"a superseded translation reached the composer: {composer}"
+        preview = page.evaluate("document.querySelector('#englishText').value")
+        assert "deploy" not in preview, f"a superseded translation reached the preview: {preview}"
+        assert errors == [], errors
+        observed.append(f"stale race: composer={composer[:44]!r} (superseded answer discarded)")
+        page.close()
+
+        # --- 5i. another window changing the provider invalidates in-flight -
+        gateway.reset()
+        page, errors = open_panel(
+            browser, harness, extension_mock(harness, gateway.base_url("slow_once"))
+        )
+        bind_target(page)
+        set_source(page, "请帮我修复部署失败的日志。")
+        translate_now(page)
+        page.wait_for_timeout(150)
+        # Simulate a second Edge window saving a different provider.
+        page.evaluate(
+            """async (url) => {
+              const provider = { ...window.__mock.local.get('zh2en.provider.v1') };
+              provider.baseUrl = url;
+              provider.credentialId = 'credential-rotated';
+              await window.__mock.externalSet('local', { 'zh2en.provider.v1': provider });
+            }""",
+            gateway.base_url("ok"),
+        )
+        page.wait_for_timeout(1800)
+        after_switch = page.evaluate("window.__mock.writer.text")
+        assert "deploy" not in after_switch, (
+            f"an in-flight request survived a provider change: {after_switch}"
+        )
+        assert errors == [], errors
+        observed.append(f"provider rotated mid-flight: composer={after_switch!r}, status={status_text(page).strip()[:38]!r}")
+        page.close()
+
+        # --- 5j. independent back-translation over the Responses protocol ---
+        gateway.reset()
+        page, errors = open_panel(
+            browser, harness, extension_mock(harness, gateway.base_url("ok"))
+        )
+        page.evaluate(
+            """async () => {
+              const provider = { ...window.__mock.local.get('zh2en.provider.v1') };
+              provider.apiProtocol = 'responses';
+              provider.modelBackTranslate = 'gpt-4o-mini';
+              const settings = { ...window.__mock.local.get('zh2en.settings.v1') };
+              settings.backTranslationMode = 'independent';
+              await window.__mock.externalSet('local', {
+                'zh2en.provider.v1': provider,
+                'zh2en.settings.v1': settings
+              });
+            }"""
+        )
+        page.wait_for_timeout(300)
+        bind_target(page)
+        set_source(page, "请帮我检查这段代码的性能问题。")
+        translate_now(page)
+        page.wait_for_function(
+            "document.querySelector('#backText').value.trim().length > 0", timeout=25000
+        )
+        back_text = page.evaluate("document.querySelector('#backText').value")
+        log = [entry for entry in gateway.request_log() if entry["endpoint"] != "models"]
+        assert all(entry["endpoint"] == "responses" for entry in log), [e["endpoint"] for e in log]
+        assert len(log) == 2, f"independent mode should be two requests, saw {len(log)}"
+        assert re.search(r"[㐀-鿿]", back_text), back_text
+        # The second request must not carry the Chinese source.
+        second = json.dumps(log[1]["body"], ensure_ascii=False)
+        assert "性能问题" not in second, "the back-translation request leaked the Chinese draft"
+        assert errors == [], errors
+        observed.append(
+            f"responses + independent back-translation: {len(log)} requests on /responses, "
+            f"back={back_text[:20]!r}"
+        )
+        page.close()
+
+        # --- 5k. repeated failures must never surface the API key -----------
+        gateway.reset()
+        page, errors = open_panel(
+            browser, harness, extension_mock(harness, gateway.base_url("ok"))
+        )
+        bind_target(page)
+        secret = page.evaluate("window.__mock.local.get('zh2en.secret.local.v1')")
+        assert secret, "the harness must have a stored key for this check to mean anything"
+        # Walk the panel through a series of gateway failures, including ones
+        # whose bodies echo the key back.
+        for scenario in [
+            "forbidden_echoes_key", "bad_gateway_html", "rate_limited",
+            "json_error_200", "sse_dropped_event", "route_not_found", "plain_text"
+        ]:
+            page.evaluate(
+                """async (url) => {
+                  const provider = { ...window.__mock.local.get('zh2en.provider.v1') };
+                  provider.baseUrl = url;
+                  await window.__mock.externalSet('local', { 'zh2en.provider.v1': provider });
+                }""",
+                gateway.base_url(scenario),
+            )
+            page.wait_for_timeout(120)
+            set_source(page, f"请帮我检查这段代码的性能问题{scenario}。")
+            translate_now(page)
+            page.wait_for_timeout(700)
+        page.locator("#diagnosticsButton").click()
+        page.wait_for_function("document.querySelector('#diagnosticsDialog').open === true")
+        surfaces = page.evaluate(
+            """() => ({
+              diagnostics: [...document.querySelectorAll('#diagnosticLog li')]
+                .map(node => node.textContent).join(' ~ '),
+              diagnosticCount: String(document.querySelectorAll('#diagnosticLog li').length),
+              status: document.querySelector('#statusBar').textContent,
+              dom: document.body.innerText,
+              stored: JSON.stringify([...window.__mock.local.entries()].filter(
+                ([key]) => !key.includes('secret')
+              )) + JSON.stringify([...window.__mock.session.entries()].filter(
+                ([key]) => !key.includes('secret')
+              ))
+            })"""
+        )
+        for where, text in surfaces.items():
+            assert secret not in text, f"the API key leaked into {where}"
+            assert "Bearer " + secret not in text, f"the auth header leaked into {where}"
+        # The draft text is not secret, but prompts and full response bodies
+        # must not be retained in diagnostics either.
+        assert "faithful Chinese-to-English translator" not in surfaces["diagnostics"], (
+            "the system prompt was retained in diagnostics"
+        )
+        assert errors == [], errors
+        observed.append(
+            f"7 consecutive gateway failures: key absent from diagnostics/status/DOM/storage, "
+            f"{surfaces['diagnosticCount']} diagnostic entries"
+        )
+        page.close()
+
+        # --- 5l. a storage failure is reported, never a silent lost draft ---
+        gateway.reset()
+        page, errors = open_panel(
+            browser, harness, extension_mock(harness, gateway.base_url("ok"))
+        )
+        page.evaluate(
+            """() => {
+              // Drafts, history and diagnostics live in chrome.storage.session.
+              const original = window.chrome.storage.session.set;
+              window.__mock.restoreSet = () => { window.chrome.storage.session.set = original; };
+              window.chrome.storage.session.set = async () => {
+                throw new Error('QUOTA_BYTES quota exceeded');
+              };
+            }"""
+        )
+        set_source(page, "请帮我检查这段代码的性能问题，磁盘配额已满。")
+        page.wait_for_function(
+            "document.querySelector('#statusBar').textContent.includes('未能保存')", timeout=15000
+        )
+        quota_status = status_text(page)
+        kept = page.evaluate("document.querySelector('#sourceText').value")
+        assert "磁盘配额已满" in kept, "the draft was dropped when storage failed"
+        page.evaluate("window.__mock.restoreSet()")
+        assert errors == [], errors
+        observed.append(f"storage quota failure: status={quota_status.strip()[:40]!r}, draft kept")
+        page.close()
+
+        # --- 5m. first run: no key, and an empty draft ----------------------
+        gateway.reset()
+        page, errors = open_panel(
+            browser, harness, extension_mock(harness, gateway.base_url("ok"))
+        )
+        bind_target(page)
+        # Empty draft: the button must not reach the network.
+        translate_now(page)
+        page.wait_for_function(
+            "document.querySelector('#statusBar').textContent.includes('请先输入中文')"
+        )
+        assert gateway.paid_requests() == 0, "an empty draft was sent to the provider"
+
+        # No key configured: fail fast and open settings instead of spending a
+        # request to collect a 401.
+        page.evaluate(
+            """async () => {
+              await window.__mock.externalSet('local', { 'zh2en.secret.local.v1': undefined });
+              window.__mock.local.delete('zh2en.secret.local.v1');
+              window.__mock.session.delete('zh2en.secret.session.v1');
+            }"""
+        )
+        set_source(page, "请帮我检查这段代码的性能问题。")
+        translate_now(page)
+        page.wait_for_function(
+            "document.querySelector('#statusBar').textContent.includes('API Key')", timeout=15000
+        )
+        assert gateway.paid_requests() == 0, "a request went out with no API key"
+        assert page.evaluate("document.querySelector('#settingsDialog').open === true"), (
+            "the settings dialog should open so the user can fix it"
+        )
+        # The external-config notice is debounced and then awaits a storage
+        # read, so it lands after this error. It is informational and must not
+        # overwrite it — otherwise the status bar claims the automatic flow is
+        # continuing while the translation actually aborted.
+        page.wait_for_timeout(800)
+        settled = status_text(page)
+        assert "API Key" in settled, (
+            f"an informational notice overwrote the actionable error: {settled!r}"
+        )
+        assert "已采纳" not in settled, settled
+        assert errors == [], errors
+        observed.append(
+            f"first run: empty draft and missing key both cost 0 requests, "
+            f"status={status_text(page).strip()[:24]!r}"
+        )
+        page.close()
+
         # --- 6. model detection populates the picker ------------------------
         page, errors = open_panel(
             browser, harness, extension_mock(harness, gateway.base_url("ok"))
