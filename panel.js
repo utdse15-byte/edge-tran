@@ -1071,6 +1071,11 @@ function providerErrorMessage(error) {
     case "empty_assistant_content":
     case "empty_response":
       return "模型响应中没有可用的 assistant 文本";
+    case "stream_event_lost":
+      // The transport lost part of the answer. Say so, and point at the one
+      // setting that avoids the streamed route entirely — otherwise this looks
+      // like the model misbehaved and retrying just spends more tokens.
+      return "流式响应中有事件无法解析，本次输出可能不完整；重试仍失败时可在设置中关闭“流式预览”改用缓冲请求";
     default:
       return error.message || "Provider 请求失败";
   }
@@ -1098,6 +1103,7 @@ function providerDiagnosticDetail(error) {
     details.push(`keys=${error.responseKeys.join(",")}`);
   }
   if (error.routeHint) details.push(`hint=${error.routeHint}`);
+  if (error.droppedEvents) details.push(`dropped=${error.droppedEvents}`);
   if (error.protocol) {
     details.push(`proto=${error.protocol}${error.streamedRequest ? "+sse" : ""}`);
   }

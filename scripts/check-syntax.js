@@ -11,7 +11,9 @@ async function walk(dir) {
     if (skip.has(entry.name)) continue;
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) await walk(full);
-    else if (entry.isFile() && entry.name.endsWith(".js")) files.push(full);
+    // .mjs was previously skipped, which left the repo's own tooling
+    // (scripts/audit.mjs, scripts/mock-provider.mjs) unchecked.
+    else if (entry.isFile() && /\.m?js$/.test(entry.name)) files.push(full);
   }
 }
 

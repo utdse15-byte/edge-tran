@@ -9,7 +9,19 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parents[1]
-CHROMIUM = os.environ.get("CHROMIUM_PATH", "/usr/bin/chromium")
+def _chromium_path():
+    """Chromium location, overridable so verify:full works off Debian too."""
+    override = os.environ.get("CHROMIUM_PATH")
+    if override:
+        return override
+    for candidate in ("/usr/bin/chromium", "/usr/bin/chromium-browser",
+                      "/usr/bin/google-chrome", "/opt/pw-browsers/chromium"):
+        if Path(candidate).exists():
+            return candidate
+    return "/usr/bin/chromium"
+
+
+CHROMIUM = _chromium_path()
 
 MOCK_EXTENSION = r"""
 (() => {

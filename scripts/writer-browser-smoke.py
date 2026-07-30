@@ -1,7 +1,21 @@
+import os
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 ROOT = Path(__file__).resolve().parents[1]
 js = (ROOT / 'writer.js').read_text(encoding='utf-8')
+
+def chromium_path():
+    """Chromium location, overridable so verify:full works off Debian too."""
+    override = os.environ.get('CHROMIUM_PATH')
+    if override:
+        return override
+    for candidate in ('/usr/bin/chromium', '/usr/bin/chromium-browser',
+                      '/usr/bin/google-chrome', '/opt/pw-browsers/chromium'):
+        if Path(candidate).exists():
+            return candidate
+    return '/usr/bin/chromium'
+
+CHROMIUM = chromium_path()
 
 def setup(page, kind='ce'):
     if kind=='ce':
@@ -22,7 +36,7 @@ def send(page, msg, wait=80):
     return page.evaluate('(id)=>window.__h.messages.findLast(m=>m.requestId===id)', msg.get('requestId'))
 
 with sync_playwright() as p:
-  b=p.chromium.launch(headless=True, executable_path='/usr/bin/chromium', args=['--no-sandbox'])
+  b=p.chromium.launch(headless=True, executable_path=CHROMIUM, args=['--no-sandbox'])
   # contenteditable
   page=b.new_page(viewport={'width':1200,'height':800}); hello=setup(page,'ce'); ws=hello['writerSession']
   r=send(page, {'type':'WRITE_TARGET','requestId':'nf','lease':'L','text':'a\nb','expectedWriterSession':ws,'expectedTargetEpoch':0,'allowFocus':False})

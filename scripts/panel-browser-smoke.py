@@ -1,11 +1,31 @@
 #!/usr/bin/env python3
 """Minimal browser smoke test for panel.html with a mocked extension API."""
 
+import os
 from pathlib import Path
 import re
 from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def chromium_path() -> str:
+    """Chromium location, overridable so verify:full works off Debian too."""
+    override = os.environ.get("CHROMIUM_PATH")
+    if override:
+        return override
+    for candidate in (
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+        "/opt/pw-browsers/chromium",
+    ):
+        if Path(candidate).exists():
+            return candidate
+    return "/usr/bin/chromium"
+
+
+CHROMIUM = chromium_path()
 
 CHROME_MOCK = r"""
 (() => {
@@ -106,7 +126,7 @@ TEST_BUNDLE = build_test_bundle()
 with sync_playwright() as playwright:
     browser = playwright.chromium.launch(
         headless=True,
-        executable_path="/usr/bin/chromium",
+        executable_path=CHROMIUM,
         args=["--no-sandbox"],
     )
     page = browser.new_page(viewport={"width": 520, "height": 900})

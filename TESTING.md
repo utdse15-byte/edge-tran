@@ -1,4 +1,4 @@
-# 人工测试清单（当前版本 0.2.13）
+# 人工测试清单（当前版本 0.2.14）
 
 自动测试覆盖翻译管线、Provider、密钥绑定、存储事务、Service Worker 租约和 Chromium 页面仿真。真实 Claude 账户中的“可见输入＝实际发送内容”仍必须由用户人工验证。
 
@@ -167,7 +167,43 @@
 - [ ] 输入框被弹层/过渡长时间遮挡（>5 秒）且文字未变：状态显示未就绪而非"被清空"；恢复可见后自动重新定位且插件所有权延续。
 - [ ] 历史消息的行内编辑框永不被自动绑定；需要时用"绑定当前页"手动指定。
 
+## 本地网关联调（0.2.14+）
+
+无需真实 API Key 与配额即可端到端验证传输层。启动自带的 OpenAI 兼容网关模拟器：
+
+```
+npm run mock:provider          # 监听 http://127.0.0.1:8787
+```
+
+然后在侧栏设置里把 Base URL 填成下面任意一条（Key 随便填），保存并测试：
+
+| Base URL | 模拟的现实情况 |
+| --- | --- |
+| `http://127.0.0.1:8787/v1` | 正常网关（缓冲与流式都可用） |
+| `http://127.0.0.1:8787/rate_limited/v1` | 429 + `Retry-After: 3` |
+| `http://127.0.0.1:8787/bad_gateway_html/v1` | nginx 502 HTML 错误页 |
+| `http://127.0.0.1:8787/login_html/v1` | 200 返回网站登录页 |
+| `http://127.0.0.1:8787`（配合 `npm run mock:provider -- --root-scenario login_html`） | Base URL 漏掉 `/v1` 前缀，网关返回网站页面 |
+| `http://127.0.0.1:8787/relay_responses_502/v1` | chat 正常、`/v1/responses` 无可用通道 |
+| `http://127.0.0.1:8787/relay_stream_502/v1` | 缓冲正常、SSE 路由坏掉 |
+| `http://127.0.0.1:8787/reject_json_then_temperature/v1` | 逐项拒绝 `response_format` 再拒绝 `temperature` |
+| `http://127.0.0.1:8787/sse_dropped_event/v1` | 流中丢一个事件（必须报传输故障，不得怪模型） |
+| `http://127.0.0.1:8787/one_byte_stream/v1` | 逐字节 SSE（事件与多字节字符全部跨包） |
+| `http://127.0.0.1:8787/slow/v1` | 慢网关（配合缩短请求超时验证超时分类） |
+| `http://127.0.0.1:8787/huge_stream/v1` | 无尽流（必须被截断并断开连接） |
+
+完整场景列表由 `npm run mock:provider` 启动时打印。`GET /__mock/requests` 可查看真实发生了几次付费请求，`GET /__mock/reset` 清零——用来核对"连打一串键只产生一次请求"这类计费行为。
+
+必查项：
+
+- [ ] 正常网关：流式预览逐步显示，最终英文写入 Claude，回译为中文。
+- [ ] 丢事件场景：状态栏说明是流式传输不完整并提示可关闭"流式预览"，**不出现**"模型可能复述了原稿"。
+- [ ] `relay_stream_502`：连通测试失败且结果行给出缓冲/流式对照诊断；关闭"流式预览"后同一网关可用。
+- [ ] 漏 `/v1` 前缀：提示 Base URL 很可能缺少 API 前缀。
+- [ ] 诊断日志与状态栏中不出现 API Key、提示词或完整响应正文。
+
 ## 自动化套件说明
 
-- `npm run verify` 只含 Node 测试、语法检查与静态审计。
-- `npm run verify:full` 追加 4 个 Chromium 冒烟/状态机套件（writer 定位/写入/发送确认、panel 状态机、换会话与断连恢复），**发布前必须跑 verify:full**。
+- `npm run verify` 只含 Node 测试、语法检查（含 `.mjs`）与静态审计。
+- `npm run verify:full` 追加 5 个 Chromium 套件（writer 定位/写入/发送确认、panel 状态机、换会话与断连恢复，以及 0.2.14 新增的 **panel-live-provider**——真实 panel 经真实 HTTP 打到本地网关再经真实 writer 写入，含计费行为核对），**发布前必须跑 verify:full**。
+- Chromium 路径由 `CHROMIUM_PATH` 覆盖，未设置时自动探测常见位置。

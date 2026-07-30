@@ -2,7 +2,19 @@
 
 在 Edge 侧边栏输入中文，插件使用你自己的 OpenAI、xAI/Grok 或 OpenAI Chat Completions 兼容供应商生成英文，并把完整英文同步到 `claude.ai` 的消息输入框；中文回译用于检查语义。
 
-当前版本：**0.2.13**。
+当前版本：**0.2.14**。
+
+## 0.2.14 更新重点（真实网关联调修复）
+
+- 项目自带 OpenAI 兼容网关模拟器 `scripts/mock-provider.mjs`（`npm run mock:provider`），把扩展放到真实 socket 上跑，修复了 6 个只在真实 HTTP 下才暴露的传输缺陷：
+  - **流式请求的 Accept 头**改为 `text/event-stream, application/json`——做内容协商的网关此前会以 406 拒绝，用户只看到一句"HTTP 406"。
+  - **流式响应不再丢失 usage / reasoning_tokens**：流式预览默认开启，此前 `reasoning_tokens` 诊断在默认配置下从来不生效。
+  - **流式路径接受 typed content parts**：代理非 OpenAI 模型的中转站常用 `content: [{type:"text"}]`，此前关掉流式能用、开着就报"assistant 文本字段为空"。
+  - **降级预算从 2 次放宽到 3 次**（每个可降级字段一次）：逐项拒绝 `response_format` / `temperature` / `stream` 的网关此前永远无法被满足。
+  - **被标错 `text/event-stream` 的 JSON 响应直接复用**，不再白白失败、不产生第二次请求。
+  - **丢失的流式事件如实报告为传输故障**（`stream_event_lost`），不再冤枉模型"复述了原稿"并多花一次修复请求。
+- 新增 89 项真实 socket 端到端测试与一个"真实 panel + 真实 HTTP + 真实 writer"的浏览器套件，后者同时核对计费行为：连打一串键只产生 1 次付费请求、重复翻译同一稿与只加尾随空格都是 +0。
+- `npm run check` 现在也检查 `.mjs`；四个浏览器套件统一支持 `CHROMIUM_PATH` 并自动探测常见路径（此前两个硬编码 `/usr/bin/chromium`，非 Debian 环境 `verify:full` 跑不起来）。
 
 ## 0.2.13 更新重点（外部定位分析核验修复）
 

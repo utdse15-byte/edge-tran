@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.2.14 — 2026-07-30
+
+真实网关联调修复版。此前所有 Provider 测试都靠替换 `globalThis.fetch` 用手写 `Response` 断言,**从未经过真实 HTTP 传输**:分块传输、跨 TCP 包切断的 SSE 事件、切在多字节字符中间的 UTF-8、内容协商、Content-Encoding、重定向、僵死连接、以及"客户端取消流服务端是否感知"全部在覆盖范围之外。本版新增一个自带的 OpenAI 兼容网关模拟器(`scripts/mock-provider.mjs`,111 个场景),让扩展在真实 socket 上跑起来,由此定位并修复 6 个传输层缺陷。
+
+### ① 流式请求的 Accept 头不正确(修复)
+
+- `buildHeaders` 对所有请求固定发送 `Accept: application/json`,包括 `stream: true` 的 SSE 请求。做真实内容协商的网关会以 **406 Not Acceptable** 拒绝,用户只看到"Provider 请求失败（HTTP 406）",完全无从判断原因。
+- 修复:流式请求改发 `Accept: text/event-stream, application/json`(保留 JSON 以便网关回落到缓冲响应)。
+
+### ② 流式响应丢失 usage 与 reasoning_tokens(修复)
+
+- SSE 组装器只把 `choices` 拼回 payload,忽略网关在末尾 chunk 上给出的 `usage`。由于**流式预览默认开启**,`result.reasoningTokens` 实际上恒为 null——0.2.9 承诺的"诊断记录与连通测试会显示返回的 reasoning_tokens 用量"在默认配置下从来不生效。
+- 修复:任何 chunk 上出现的 `usage` 都被采纳并写回组装后的 payload,流式与缓冲的用量口径一致。不额外发送 `stream_options`,不产生新的兼容风险。
+
+### ③ 流式路径不接受 typed content parts(修复)
+
+- 缓冲路径的 `extractAssistantText` 早已支持 `content: [{type:"text",text:"…"}]`,流式路径只认 `typeof delta.content === "string"`。代理非 OpenAI 模型的中转站普遍用数组形式,于是同一个网关**关掉流式预览能用、开着就报"assistant 文本字段为空"**。
+- 修复:新增 `streamedDeltaText`,流式与缓冲共用同一套 content 解析口径;非文本部件仍然产出空串,交由终局校验拒绝。
+
+### ④ 三个可降级字段只有两次降级预算(修复)
+
+- 兼容降级循环上限是 3 次尝试(即最多 2 次降级),但可降级字段有三个:`response_format`、`temperature`、`stream`。上限是流式功能(0.2.8)加入之前定下的——逐项拒绝这三个字段的网关**永远无法被满足**,报"请求参数或模型协议不兼容"且不提示"关掉流式预览即可"。
+- 修复:上限放宽到 4 次尝试 / 每字段一次降级。无名 400/422 仍然立刻失败、绝不进入重试循环,预算只对"明确指名字段"的拒绝放宽。
+
+### ⑤ 被标错 Content-Type 的 JSON 响应白白失败(修复)
+
+- 部分网关对所有响应一律标 `text/event-stream`,正文却是普通 JSON。SSE 解析器一个事件都没取到 → 报"Provider 流式响应为空",而完整正文其实就在内存里。
+- 修复:流中确实没有任何事件时,尝试把缓冲区当作 JSON 正文解析并复用。**不产生第二次请求**,不重复计费。
+
+### ⑥ 丢失的流式事件被算到模型头上(修复)
+
+- 以 `{` / `[` 开头却解析失败的 `data:` 载荷 = 丢了一个 delta,原先被静默忽略。流仍以 `finish_reason: stop` 收尾,于是拼出来的是**中间缺一块的译文**;校验随后失败并报"模型可能复述了原稿",把传输故障说成模型的错,还要再花一次修复请求。
+- 修复:新增 `stream_event_lost` 错误码(带 `droppedEvents` 计数),如实报告传输不完整;面板文案同时给出"可在设置中关闭流式预览改用缓冲请求"的出路。非 JSON 的 keep-alive(`data: ping` 之类)仍然照常忽略;`[DONE]` 改用 trim 比较,避免 `data: [DONE] ` 这种带尾随空白的写法被误判成丢包。
+
+### 工具与测试
+
+- **新增 `scripts/mock-provider.mjs`**:零依赖的 OpenAI 兼容网关模拟器,实现 `/v1/chat/completions`(缓冲 + SSE)、`/v1/responses`(缓冲 + SSE)、`/v1/models`,内置确定性词典翻译模型(遵守 english / back_translation / corrections / ambiguous 契约与占位符规则)。111 个场景各自是一个 Base URL(`http://127.0.0.1:8787/<scenario>/v1`):限流、5xx、nginx HTML、登录页、GBK、gzip、BOM、重定向、socket reset、僵死流、逐字节 SSE、切在多字节字符中间、CRLF + 注释心跳、pretty-print 多行 data、丢事件、超限响应、逐项参数拒绝、思考字段拒绝、协议错配、占位符破坏、越界纠错……`npm run mock:provider` 可直接给真实扩展当本地网关手动联调。
+- **新增 `tests/e2e-provider.test.js`(89 项)**:全部经真实 socket 驱动 `lib/translator.js` + `lib/provider.js`。
+- **新增 `scripts/panel-live-provider-test.py`**:Chromium 里跑真实 `panel.js`,通过真实 HTTP 打到本地网关,再经真实 writer 链路写入。覆盖流式预览增量落到 UI、限流不写入、丢包文案不冤枉模型、运行期降级不被持久化、SSE 路由故障的连通测试诊断、评审提醒渲染、模型探测,以及**计费行为**:连打一串键只产生 1 次付费请求、重复翻译同一稿 +0、只加尾随空格 +0(服务端计数核对)。
+- `npm run check` 此前只检查 `.js`,`.mjs` 被整体跳过(包括 `scripts/audit.mjs` 自己);现已纳入。
+- 四个浏览器套件里有两个把 Chromium 路径硬编码成 `/usr/bin/chromium`,`CHROMIUM_PATH` 只在另外两个生效——非 Debian 环境下 `verify:full` 直接跑不起来。现已统一支持环境变量并自动探测常见路径。
+- `TranslationValidationError` 的 errors 数组去重:占位符还原前后两层校验会产出同一句话,用户此前会看到"模型返回的 back_translation为空；…；模型返回的 back_translation为空"。
+- 审计新增 0.2.14 传输不变量锚点(流式 Accept、`streamedDeltaText`、`stream_event_lost`、`chatUsage`)。
+
+### 复核确认无问题的行为(不改动)
+
+真实网关下逐项确认符合设计:401/403 不重试且不回显 Key(即使网关把 Key 原样写进错误正文);429 的 `Retry-After` 秒数与 HTTP-date 都能解析,冷却下限 3 秒、上限 24 小时;5xx 与普通 400 在 Provider 层不重试;超限响应在有无 `Content-Length` 两种情况下都被截断,无尽流被取消且服务端确实观察到断开;重定向按 `redirect: "error"` 拒绝;GBK 乱码不会被当成合法译文;模型列表上限 5000 并去重清洗;超大错误正文仍按 HTTP 状态分类;`error: null` 不误判为逻辑错误;同时带可用 choices 与 error 对象的 200 照旧拒绝;Windows/`~`/`$VAR` 路径、emoji 与星平面字符、字面占位符文本全部原样保留;占位符还原后超 100,000 字符按设计硬失败。
+
 ## 0.2.13 — 2026-07-20
 
 外部定位分析核验修复版。用户提供了另一份 AI 对定位不稳定的代码级分析(基于 main@0.2.11);逐条对照当前代码核验,5 项发现中 4 项确认属实并修复,1 项(BIND_RESULT 竞态)确认为低危、采取轻量缓解。

@@ -136,7 +136,14 @@ for (const required of [
   "MAX_MESSAGE_CONTENT_CHARS",
   "MAX_ASSISTANT_TEXT_CHARS",
   "SECRET_LIKE_HEADER_PATTERN",
-  "message?.tool_calls"
+  "message?.tool_calls",
+  // 0.2.14 transport invariants. Each of these was a real defect found by
+  // running the extension against a live local gateway; they are cheap to
+  // regress silently because no unit test with a stubbed fetch can see them.
+  'Accept: streaming ? "text/event-stream, application/json"',
+  "streamedDeltaText",
+  "stream_event_lost",
+  "chatUsage"
 ]) {
   if (!providerText.includes(required)) throw new Error(`Provider safety invariant missing: ${required}`);
 }
