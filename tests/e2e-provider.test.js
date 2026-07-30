@@ -263,6 +263,46 @@ test("a lost stream event is reported as a transport fault, not model misbehavio
   assert.equal(chatRequests().length, 1, "a truncated stream must not silently pay for a repair");
 });
 
+test("the billable request count is reported for degradation and repair retries", async () => {
+  const plain = await translate("ok");
+  assert.equal(plain.requestCount, 1, "a clean translation is one request");
+
+  mock.reset();
+  const degraded = await translate("reject_json_then_temperature");
+  assert.equal(degraded.requestCount, 3, "two degradations means three requests");
+  assert.equal(degraded.requestCount, chatRequests().length);
+
+  mock.reset();
+  const repaired = await translate("invalid_json_once");
+  assert.equal(repaired.requestCount, 2, "a JSON repair retry is a second request");
+  assert.equal(repaired.requestCount, chatRequests().length);
+
+  mock.reset();
+  const back = await backTranslate({
+    english: "please review this snippet",
+    sourceForWarnings: SOURCE,
+    config: config("reject_temperature"),
+    apiKey: KEY,
+    model: MODEL
+  });
+  assert.equal(back.requestCount, chatRequests().length);
+});
+
+test("a local pre-flight failure keeps its actionable message", async () => {
+  // A non-Latin-1 auth prefix cannot go into an HTTP header, so buildHeaders
+  // throws a plain Error before any request is made. The connection test used
+  // to collapse every non-ProviderError into a bare "连接测试失败", discarding
+  // the one sentence that says what is wrong.
+  const error = await expectFailure(testTranslationConnection({
+    config: config("ok", { authPrefix: "令牌" }),
+    apiKey: KEY,
+    model: MODEL
+  }));
+  assert.equal(chatRequests().length, 0, "a local failure must not spend a request");
+  assert.match(error.message, /连接测试失败/);
+  assert.match(error.message, /Latin-1/, `the reason was discarded: ${error.message}`);
+});
+
 test("a gateway refusing response_format, temperature and stream is still reachable", async () => {
   // Three degradable fields need three degradation steps; with only two the
   // streamed configuration could never be satisfied.

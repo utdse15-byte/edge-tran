@@ -1943,6 +1943,11 @@ async function translateNow({ forceSync = false, forceOverwrite = false, reason 
     if (Number.isFinite(result.reasoningTokens)) {
       addDiagnostic(`本次翻译的推理用量：${result.reasoningTokens} reasoning tokens`);
     }
+    // Compatibility degradation and JSON-repair retries are otherwise invisible
+    // on a metered API. Only worth a line when it cost more than one request.
+    if (Number.isFinite(result.requestCount) && result.requestCount > 1) {
+      addDiagnostic(`本次翻译实际发出 ${result.requestCount} 次请求（兼容降级或格式重试）`);
+    }
     state.draft.english = result.english;
     state.draft.corrections = result.corrections;
     state.draft.ambiguities = result.ambiguities;
@@ -3173,6 +3178,7 @@ async function testProviderFromForm() {
 
     let capabilityPatch = { ...(result.capabilityPatch ?? {}) };
     let backPreviewText = result.backTranslation || "";
+    let independentRequestCount = 0;
     if (backMode === BACK_TRANSLATION_MODES.INDEPENDENT) {
       const independentResult = await backTranslate({
         english: result.english,
@@ -3190,6 +3196,7 @@ async function testProviderFromForm() {
       });
       if (!formRequestIsCurrent(request)) return;
       capabilityPatch = { ...capabilityPatch, ...(independentResult.capabilityPatch ?? {}) };
+      independentRequestCount = independentResult.requestCount ?? 1;
       backPreviewText = independentResult.chinese;
     }
 
@@ -3202,7 +3209,11 @@ async function testProviderFromForm() {
     const reasoningNote = Number.isFinite(result.reasoningTokens)
       ? ` · reasoning=${result.reasoningTokens}`
       : "";
-    ui.providerTestResult.textContent = `通过 · ${Math.round(performance.now() - started)} ms · ${probeContext.transportLabel}${reasoningNote} · ${result.english.slice(0, 70)}${backPreview}`;
+    // Total billable requests the test itself spent, so a gateway that needs
+    // two degradation steps is visible before it silently triples live cost.
+    const spent = (result.requestCount ?? 1) + (independentRequestCount ?? 0);
+    const requestNote = spent > 1 ? ` · ${spent} 次请求` : "";
+    ui.providerTestResult.textContent = `通过 · ${Math.round(performance.now() - started)} ms · ${probeContext.transportLabel}${reasoningNote}${requestNote} · ${result.english.slice(0, 70)}${backPreview}`;
   } catch (error) {
     if (error?.name !== "AbortError" && formRequestIsCurrent(request)) {
       const baseMessage = providerFormErrorMessage(error) || error.message;
