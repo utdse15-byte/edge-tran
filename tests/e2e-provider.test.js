@@ -955,6 +955,63 @@ test("a model list failure does not block a manually typed model id", async () =
 });
 
 // ---------------------------------------------------------------------------
+// Malformed-payload sweep
+// ---------------------------------------------------------------------------
+
+// Every one of these must fail as a classified error. A raw TypeError would
+// reach the side panel as an unhandled error with no actionable message, and
+// any response body a gateway can emit must land in a known bucket.
+const MALFORMED_PAYLOADS = [
+  ["null body", "null"],
+  ["bare array", "[]"],
+  ["bare string", '"hello"'],
+  ["bare number", "42"],
+  ["choices null", '{"choices":null}'],
+  ["choices [null]", '{"choices":[null]}'],
+  ["choices [42]", '{"choices":[42]}'],
+  ["choices [{}]", '{"choices":[{}]}'],
+  ["message null", '{"choices":[{"message":null,"finish_reason":"stop"}]}'],
+  ["message string", '{"choices":[{"message":"hi","finish_reason":"stop"}]}'],
+  ["content object", '{"choices":[{"message":{"role":"assistant","content":{"english":"x"}},"finish_reason":"stop"}]}'],
+  ["content number", '{"choices":[{"message":{"role":"assistant","content":5},"finish_reason":"stop"}]}'],
+  ["content array of numbers", '{"choices":[{"message":{"role":"assistant","content":[1,2]},"finish_reason":"stop"}]}'],
+  ["legacy completions text field", '{"choices":[{"text":"{\\"english\\":\\"x\\"}","finish_reason":"stop"}]}'],
+  ["finish_reason object", '{"choices":[{"message":{"role":"assistant","content":"{}"},"finish_reason":{"a":1}}]}'],
+  ["english as number", '{"choices":[{"message":{"role":"assistant","content":"{\\"english\\":42}"},"finish_reason":"stop"}]}'],
+  ["english as object", '{"choices":[{"message":{"role":"assistant","content":"{\\"english\\":{\\"a\\":1}}"},"finish_reason":"stop"}]}'],
+  ["corrections as object", '{"choices":[{"message":{"role":"assistant","content":"{\\"english\\":\\"ok text here\\",\\"back_translation\\":\\"中文回译内容够长了\\",\\"corrections\\":{\\"a\\":1}}"},"finish_reason":"stop"}]}'],
+  ["unterminated model json", '{"choices":[{"message":{"role":"assistant","content":"{\\"english\\":\\"abc"},"finish_reason":"stop"}]}']
+];
+
+test("no malformed response escapes classification", async () => {
+  for (const [label, body] of MALFORMED_PAYLOADS) {
+    mock.reset();
+    // Two identical bodies: a repair retry must hit the same shape, not the
+    // scenario's success fallback.
+    mock.queueRaw(body);
+    mock.queueRaw(body);
+    mock.queueRaw(body);
+    const error = await expectFailure(translate("raw"));
+    assert.ok(
+      error instanceof ProviderError || error instanceof TranslationValidationError,
+      `${label}: unclassified ${error.name}: ${error.message}`
+    );
+    assert.ok(String(error.message).trim().length > 0, `${label}: empty message`);
+  }
+});
+
+test("a response body cannot pollute Object.prototype", async () => {
+  mock.reset();
+  mock.queueRaw(
+    '{"__proto__":{"zh2enPolluted":true},"choices":[{"message":{"role":"assistant",'
+    + '"content":"{\\"english\\":\\"please review this snippet\\",'
+    + '\\"back_translation\\":\\"请检视这段程序内容\\"}"},"finish_reason":"stop"}]}'
+  );
+  await translate("raw");
+  assert.equal({}.zh2enPolluted, undefined, "prototype was polluted by a response body");
+});
+
+// ---------------------------------------------------------------------------
 // Cancellation and concurrency
 // ---------------------------------------------------------------------------
 

@@ -367,6 +367,101 @@ def main() -> None:
         )
         page.close()
 
+        # --- 5e. IME composition must not translate half-typed pinyin -------
+        gateway.reset()
+        page, errors = open_panel(
+            browser,
+            harness,
+            extension_mock(
+                harness, gateway.base_url("ok"), automation_mode="auto_sync", debounce_ms=200
+            ),
+        )
+        bind_target(page)
+        # A Chinese IME fires input events for every composition update. Those
+        # intermediate values are half-formed and must never be billed.
+        page.evaluate(
+            """async () => {
+              const editor = document.querySelector('#sourceText');
+              editor.focus();
+              editor.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+              for (const partial of ['q', 'qing', '请b', '请bang', '请帮w']) {
+                editor.value = partial;
+                editor.dispatchEvent(new CompositionEvent('compositionupdate', { bubbles: true, data: partial }));
+                editor.dispatchEvent(new Event('input', { bubbles: true }));
+                await new Promise(resolve => setTimeout(resolve, 120));
+              }
+              editor.value = '请帮我检查这段代码的性能问题。';
+              editor.dispatchEvent(new Event('input', { bubbles: true }));
+              editor.dispatchEvent(new CompositionEvent('compositionend', {
+                bubbles: true, data: '请帮我检查这段代码的性能问题。'
+              }));
+            }"""
+        )
+        page.wait_for_function(
+            "window.__mock.writer.text.includes('please help me review this snippet')",
+            timeout=20000,
+        )
+        page.wait_for_timeout(600)
+        ime_log = [entry for entry in gateway.request_log() if entry["endpoint"] != "models"]
+        assert len(ime_log) == 1, f"IME composition cost {len(ime_log)} paid requests"
+        sent = ime_log[0]["body"]["messages"][-1]["content"]
+        assert sent == "请帮我检查这段代码的性能问题。", f"a partial composition was translated: {sent!r}"
+        assert errors == [], errors
+        observed.append(f"IME composition: 1 request, sent={sent!r}")
+        page.close()
+
+        # --- 5f. a transient 500 recovers without user action ---------------
+        gateway.reset()
+        page, errors = open_panel(
+            browser, harness, extension_mock(harness, gateway.base_url("flaky_500"))
+        )
+        bind_target(page)
+        set_source(page, "请帮我修复部署失败的日志。")
+        translate_now(page)
+        page.wait_for_function(
+            "window.__mock.writer.text.length > 0", timeout=20000
+        )
+        recovered = page.evaluate("window.__mock.writer.text")
+        attempts = gateway.paid_requests()
+        assert "deploy" in recovered, recovered
+        assert attempts == 2, f"a transient 5xx should cost exactly one retry, saw {attempts}"
+        assert errors == [], errors
+        observed.append(f"transient 500: recovered after {attempts} requests")
+        page.close()
+
+        # --- 5g. pasting an oversized document costs nothing ----------------
+        gateway.reset()
+        page, errors = open_panel(
+            browser,
+            harness,
+            extension_mock(
+                harness, gateway.base_url("ok"), automation_mode="auto_sync", debounce_ms=200
+            ),
+        )
+        bind_target(page)
+        oversized = "请检查这段代码的性能问题。" * 5000  # ~65k code points
+        page.fill("#sourceText", oversized)
+        page.dispatch_event("#sourceText", "input")
+        page.wait_for_function(
+            "document.querySelector('#sourceCount').textContent.includes('超出')", timeout=15000
+        )
+        translate_now(page)
+        page.wait_for_function(
+            "document.querySelector('#statusBar').textContent.includes('50,000')", timeout=15000
+        )
+        page.wait_for_timeout(600)
+        assert gateway.paid_requests() == 0, "an over-limit draft was sent to the provider"
+        # The draft itself must survive: 0.2.x preserves oversized text so the
+        # user can split it instead of losing it.
+        kept = page.evaluate("document.querySelector('#sourceText').value.length")
+        assert kept == len(oversized), f"the oversized draft was truncated: {kept}"
+        assert errors == [], errors
+        observed.append(
+            f"oversized draft: 0 paid requests, {kept} chars preserved, "
+            f"status={status_text(page).strip()[:40]!r}"
+        )
+        page.close()
+
         # --- 6. model detection populates the picker ------------------------
         page, errors = open_panel(
             browser, harness, extension_mock(harness, gateway.base_url("ok"))

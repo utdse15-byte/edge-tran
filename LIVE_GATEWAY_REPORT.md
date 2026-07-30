@@ -18,7 +18,7 @@ globalThis.fetch = async () => new Response(JSON.stringify({ choices: [...] }), 
 - 客户端因超限取消流时，**服务端是否真的观察到断开**；
 - 网关把 `Content-Type` 标错、把错误正文写成 HTML、把 JSON 用 GBK 编码等真实中转站行为。
 
-所以这一轮先**自建一个 OpenAI 兼容网关**（`scripts/mock-provider.mjs`，零依赖，111 个场景），把扩展放到真实 socket 上按真实使用方式跑，再逐项对照预期行为。
+所以这一轮先**自建一个 OpenAI 兼容网关**（`scripts/mock-provider.mjs`，零依赖，112 个场景），把扩展放到真实 socket 上按真实使用方式跑，再逐项对照预期行为。
 
 ## 方法
 
@@ -26,7 +26,7 @@ globalThis.fetch = async () => new Response(JSON.stringify({ choices: [...] }), 
 
 | 层 | 载体 | 覆盖 |
 | --- | --- | --- |
-| 传输/翻译管线 | `tests/e2e-provider.test.js`（89 项，`npm test`） | `lib/translator.js` + `lib/provider.js` 直接打真实 socket |
+| 传输/翻译管线 | `tests/e2e-provider.test.js`（91 项，`npm test`） | `lib/translator.js` + `lib/provider.js` 直接打真实 socket |
 | 真实 UI 全链路 | `scripts/panel-live-provider-test.py`（`npm run verify:full`） | Chromium 里跑真实 `panel.js` → 真实 HTTP → 真实 writer 链路 |
 | 人工联调 | `npm run mock:provider` | 侧载真实扩展，Base URL 指向本地网关（见 TESTING.md 场景表） |
 
@@ -67,6 +67,8 @@ globalThis.fetch = async () => new Response(JSON.stringify({ choices: [...] }), 
 - **越界纠错**：中文数字改写、极性反转、超量纠错、非数组 corrections 全部本地拒绝；被拒绝后自动改走"禁止纠错"的字面重译。
 - **计费**（服务端计数核对）：连打一串键只产生 1 次付费请求；重复翻译同一稿 +0；只加尾随空格 +0；流式回落到缓冲响应时不产生第二次请求；标错 Content-Type 的复用也不产生第二次请求。
 - **运行期降级不落盘**：真实网关上发生的能力降级只存在于内存，未经显式连通测试不写入存储。
+- **畸形响应全部有归类**：19 种畸形正文（`null` / 裸数组 / 裸字符串 / `choices` 为 null / `choices:[null]` / `message` 为字符串 / content 为对象或数字数组 / legacy `text` 字段 / `finish_reason` 为对象 / `english` 为数字或对象 / `corrections` 为对象 / 截断的模型 JSON …）逐一验证：**没有任何一个逃出 ProviderError / TranslationValidationError**，即不会有裸 `TypeError` 带着无信息的报错冒到面板上；响应正文里的 `__proto__` 也污染不了 `Object.prototype`。
+- **真实 UI 上的中文输入链路**：IME 组词期间不发请求——`compositionstart`→多次 `input`→`compositionend` 全程只产生 1 次付费请求，且发出的是完整句子而非半成品拼音；一次瞬时 500 按设计自动重试一次即恢复（共 2 次请求）；粘贴 65,000 字超限草稿时 **0 次付费请求**、原文 65,000 字全量保留、状态栏给出拆分提示。
 
 ## 仍存在的限制与后续建议（本轮未改）
 
@@ -80,7 +82,7 @@ globalThis.fetch = async () => new Response(JSON.stringify({ choices: [...] }), 
 ## 如何重跑
 
 ```
-npm run verify        # 语法（含 .mjs）+ 181 项 Node 测试 + 静态审计
+npm run verify        # 语法（含 .mjs）+ 183 项 Node 测试 + 静态审计
 npm run verify:full   # 追加 5 个 Chromium 套件（含 panel-live-provider）
 npm run mock:provider # 人工联调：把扩展 Base URL 指向 http://127.0.0.1:8787/<scenario>/v1
 ```

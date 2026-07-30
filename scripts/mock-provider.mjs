@@ -1237,6 +1237,21 @@ scenario("choices_and_error", (ctx) => json(ctx.res, 200, {
   error: { message: "partial upstream failure", code: "partial_failure" }
 }));
 
+// Serves whatever the test queued with handle.queueRaw(). Used for the
+// malformed-payload sweep: every response body must still fail as a classified
+// error rather than a raw TypeError reaching the panel.
+scenario("raw", (ctx) => {
+  const next = ctx.state.queue?.shift();
+  if (!next) return json(ctx.res, 200, chatEnvelope(modelReply(ctx.body.messages)));
+  const body = Buffer.from(next.body, "utf8");
+  ctx.res.writeHead(next.status ?? 200, {
+    "Content-Type": next.contentType ?? "application/json",
+    "Content-Length": String(body.byteLength),
+    ...CORS_HEADERS
+  });
+  ctx.res.end(body);
+});
+
 // -- /models variants -------------------------------------------------------
 
 scenario("models_missing", (ctx) => {
@@ -1412,6 +1427,13 @@ export function startMockProvider({ port = 0, host = "127.0.0.1", log = false, r
         baseUrl: (scenarioName = "ok") => `http://${host}:${address.port}/${scenarioName}/v1`,
         requests,
         state: (name) => states.get(name) ?? {},
+        // Queue raw response bodies for the "raw" scenario, one per request.
+        queueRaw: (body, options = {}) => {
+          if (!states.has("raw")) states.set("raw", {});
+          const state = states.get("raw");
+          state.queue = state.queue ?? [];
+          state.queue.push({ body, ...options });
+        },
         reset: () => {
           requests.length = 0;
           states.clear();
