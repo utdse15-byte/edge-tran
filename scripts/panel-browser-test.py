@@ -112,7 +112,8 @@ MOCK_EXTENSION = r"""
     nextClearMode: 'normal',
     writes: [],
     clears: [],
-    forcedClears: []
+    forcedClears: [],
+    ownedTail: ''
   };
 
   function emit(message) {
@@ -186,7 +187,17 @@ MOCK_EXTENSION = r"""
           });
           return;
         }
-        writer.text = String(message.text || '');
+        // v0.2.15 append contract, mirrored from writer.js: the translation is
+        // appended after whatever is already there, and only the plugin's own
+        // previous segment is replaced.
+        {
+          const incoming = String(message.text || '');
+          const base = writer.pluginOwned && writer.ownedTail && writer.text.endsWith(writer.ownedTail)
+            ? writer.text.slice(0, writer.text.length - writer.ownedTail.length).replace(/\n+$/, '')
+            : writer.text;
+          writer.text = base ? `${base}\n\n${incoming}` : incoming;
+          writer.ownedTail = incoming;
+        }
         writer.pluginOwned = true;
         writer.epoch += 1;
         respond({
@@ -478,7 +489,13 @@ def main() -> None:
         # guard rejected every manual-phase write even when force=true.
         writes_before_reclaim = page.evaluate("window.__mock.writer.writes.length")
         page.locator("#syncButton").click()
-        page.wait_for_function("window.__mock.writer.text === 'Third version.'", timeout=10000)
+        # v0.2.15: reclaiming appends after the human edit rather than
+        # replacing it — the manual text is never destroyed.
+        page.wait_for_function(
+            "window.__mock.writer.text.includes('Third version.')", timeout=10000
+        )
+        reclaimed = page.evaluate("window.__mock.writer.text")
+        assert reclaimed.startswith("human edit"), reclaimed
         assert page.evaluate("window.__mock.writer.writes.length") == writes_before_reclaim + 1
         assert page.evaluate("window.__mock.writer.writes.at(-1).force") is True
         assert page.locator("#manualBanner").get_attribute("class") and "hidden" in page.locator("#manualBanner").get_attribute("class").split()
@@ -789,20 +806,26 @@ def main() -> None:
             }
           });
         """)
-        stability_page.wait_for_function(
-            "document.querySelector('#statusBar').textContent.includes('已有内容')", timeout=10000
-        )
+        # v0.2.15: pre-existing user content is no longer a special state at
+        # all — no banner, no pause, no status diversion. The next translation
+        # is simply appended after it by the writer.
+        stability_page.wait_for_timeout(300)
         assert "hidden" in (stability_page.locator("#manualBanner").get_attribute("class") or "").split(), \
             "pre-existing user content must not raise the conflict banner"
         assert stability_page.locator("#pauseButton").inner_text() == "暂停", \
             "pre-existing user content must not pause automation"
+        assert "已有内容" not in stability_page.locator("#statusBar").inner_text(), \
+            "the append contract has no 已有内容 diversion"
 
         stability_page.locator("#sourceText").fill("第三版。")
+        # v0.2.15: auto-sync now appends after the user's content instead of
+        # holding the translation back. Nothing of theirs may be removed.
         stability_page.wait_for_function(
-            "document.querySelector('#statusBar').textContent.includes('未写入')", timeout=10000
+            "window.__mock.writer.text.includes('Third version.')", timeout=10000
         )
-        assert stability_page.evaluate("window.__mock.writer.text") == "my own notes", \
-            "auto-sync must never delete user content"
+        composed = stability_page.evaluate("window.__mock.writer.text")
+        assert composed.startswith("my own notes"), \
+            f"auto-sync must never delete user content: {composed!r}"
         assert stability_page.evaluate("window.__mock.writer.forcedClears.length") == 0
 
         stability_page.locator("#clearTargetButton").click()

@@ -60,14 +60,16 @@ with sync_playwright() as p:
   page.wait_for_timeout(80)
   manual=page.evaluate('window.__h.messages.findLast(m=>m.type==="TARGET_MANUAL_EDIT")')
   assert manual and manual['text']=='plugin user' and manual['targetEpoch']>epoch, manual
-  # Force write, then trusted send click + DOM clear without input should confirm.
-  r=send(page, {'type':'WRITE_TARGET','requestId':'w3','lease':'L','text':'to send','expectedWriterSession':ws,'expectedTargetEpoch':manual['targetEpoch'],'allowFocus':True,'force':True})
-  assert r['ok']; epoch=r['targetEpoch']
+  # v0.2.15 append contract: the user's text is kept and the translation is
+  # appended after it, so the confirmed send carries BOTH.
+  r=send(page, {'type':'WRITE_TARGET','requestId':'w3','lease':'L','text':'to send','expectedWriterSession':ws,'expectedTargetEpoch':manual['targetEpoch'],'allowFocus':True})
+  assert r['ok'] and r['readback']=='plugin user\n\nto send', r
+  epoch=r['targetEpoch']
   page.locator('#send').click()
   page.locator('#editor').evaluate('(e)=>e.replaceChildren()')
   page.wait_for_timeout(100)
   sent=page.evaluate('window.__h.messages.findLast(m=>m.type==="SEND_CONFIRMED")')
-  assert sent and sent['sentText']=='to send' and sent['targetEpoch']==epoch+1, page.evaluate('window.__h.messages')
+  assert sent and sent['sentText']=='plugin user\n\nto send' and sent['targetEpoch']==epoch+1, page.evaluate('window.__h.messages')
   page.close()
 
   # textarea exact blank lines, no focus needed

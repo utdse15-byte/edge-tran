@@ -37,6 +37,11 @@
   let lastWritten = "";
   let lastObservedText = "";
   let pluginOwned = false;
+  // Append mode (0.2.15): the exact translation text the plugin last appended,
+  // WITHOUT the blank-line separator. Everything before it belongs to the user
+  // and is never selected, replaced or deleted. Empty when the plugin has
+  // nothing of its own in the composer.
+  let appendedText = "";
   let suppressUntil = 0;
   let expectedWriteText = "";
   let sendIntent = null;
@@ -1332,6 +1337,74 @@
     }
   }
 
+  // Total length of the editor's text nodes. This is the unit
+  // selectTrailingChars() walks in, and it is deliberately NOT the same as the
+  // serialized length: serialization synthesises a newline at every block
+  // boundary, and those newlines exist in no text node. Sizing a selection
+  // with serialized lengths walks too far back and eats the user's characters.
+  function nodeTextOf(element) {
+    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+    let out = "";
+    let node;
+    while ((node = walker.nextNode())) out += node.data;
+    return out;
+  }
+
+  // Selects exactly the last `count` characters of the editor's raw text by
+  // walking text nodes backwards. Append mode uses this to replace only the
+  // segment the plugin itself inserted: the user's content never enters the
+  // selection, so attachment chips and other atomic nodes are never removed.
+  // `count === 0` collapses the caret to the very end (pure append).
+  function selectTrailingChars(element, count) {
+    const selection = window.getSelection();
+    if (!selection) return false;
+    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+    const textNodes = [];
+    let node;
+    while ((node = walker.nextNode())) textNodes.push(node);
+
+    const range = document.createRange();
+    if (textNodes.length === 0) {
+      range.selectNodeContents(element);
+      range.collapse(false);
+      if (count > 0) return false; // nothing to replace but a tail was expected
+    } else {
+      const last = textNodes[textNodes.length - 1];
+      range.setEnd(last, last.data.length);
+      let remaining = count;
+      let placed = remaining === 0;
+      if (placed) range.setStart(last, last.data.length);
+      for (let index = textNodes.length - 1; index >= 0 && !placed; index -= 1) {
+        const current = textNodes[index];
+        if (remaining <= current.data.length) {
+          range.setStart(current, current.data.length - remaining);
+          placed = true;
+          break;
+        }
+        remaining -= current.data.length;
+      }
+      // The tail spans more characters than the editor holds: refuse rather
+      // than silently swallowing content that is not ours.
+      if (!placed) return false;
+    }
+    selection.removeAllRanges();
+    selection.addRange(range);
+    return true;
+  }
+
+  // Append-mode edit: replace only our own trailing segment (or nothing at
+  // all) and insert the new one. Never selects user content.
+  function runAppendCommand(element, ownedTailLength, addition) {
+    element.focus({ preventScroll: true });
+    if (!selectTrailingChars(element, ownedTailLength)) return false;
+    try {
+      if (addition) return document.execCommand("insertText", false, addition);
+      return ownedTailLength > 0 ? document.execCommand("delete", false) : true;
+    } catch {
+      return false;
+    }
+  }
+
   async function writeContentEditableFocus(operation, element, text) {
     const before = readComposerText(element);
     const previousActive = document.activeElement;
@@ -1465,6 +1538,95 @@
     };
   }
 
+  // Where does the plugin's own segment start, and what precedes it?
+  // `appendedRaw` is only trusted when it is still literally at the end of the
+  // editor; the moment the user edits it, the whole composer counts as theirs
+  // and the next translation is appended after it rather than replacing it.
+  function appendPlan(element, text) {
+    const current = readComposerText(element);
+    // A text control's value lives on the element, not in child text nodes —
+    // walking the DOM there returns the original markup, never the typed text.
+    const nodeText = isTextControl(element)
+      ? String(element.value ?? "")
+      : nodeTextOf(element);
+    // Our segment is still ours only while it sits untouched at the very end,
+    // in both the normalized view and the raw text nodes. One keystroke inside
+    // it and the whole composer counts as the user's, so the next translation
+    // is appended after it rather than replacing it.
+    const owned = Boolean(
+      pluginOwned
+      && appendedText
+      && nodeText.endsWith(appendedText)
+      && current.endsWith(appendedText)
+    );
+
+    if (owned) {
+      // The separator already exists in the DOM as block structure, which is
+      // not made of text characters and therefore survives the replacement.
+      // Re-inserting it would stack another blank line on every retranslation.
+      const base = current.slice(0, current.length - appendedText.length);
+      return {
+        ownedLength: appendedText.length,
+        prefixNodeChars: nodeText.length - appendedText.length,
+        addition: text,
+        expected: normalizeText(base + text)
+      };
+    }
+
+    const separator = current ? "\n\n" : "";
+    return {
+      ownedLength: 0,
+      prefixNodeChars: nodeText.length,
+      addition: `${separator}${text}`,
+      expected: normalizeText(`${current}${separator}${text}`)
+    };
+  }
+
+  async function appendComposerText(operation, target, plan, { allowFocus = true } = {}) {
+    if (!target || target !== composer || !target.isConnected) {
+      return { ok: false, code: "target_changed", focusUsed: false };
+    }
+    if (isTextControl(target)) {
+      // No atomic nodes are possible in a plain control, so a native set of the
+      // recomposed value is both safe and cheaper than a selection dance.
+      return writeTextControl(operation, target, plan.expected);
+    }
+    if (!allowFocus) {
+      return { ok: false, code: "focus_write_disabled", strategy: "focus-required", focusUsed: false };
+    }
+    const before = readComposerText(target);
+    const previousActive = document.activeElement;
+    runAppendCommand(target, plan.ownedLength, plan.addition);
+    await settleDom();
+
+    if (!operationStillCurrent(operation)) {
+      const interrupted = readComposerText(target);
+      restorePageFocus(previousActive, target);
+      await settleDom();
+      return {
+        ok: false,
+        code: operation.userInterference ? "write_interrupted" : "write_failed_not_restored",
+        strategy: "focus-append",
+        focusUsed: true,
+        before,
+        readback: interrupted,
+        restored: interrupted === before
+      };
+    }
+
+    const readback = readComposerText(target);
+    restorePageFocus(previousActive, target);
+    await settleDom();
+    return {
+      ok: readback === plan.expected,
+      code: readback === plan.expected ? "ok" : "write_failed",
+      strategy: "focus-append",
+      focusUsed: true,
+      before,
+      readback
+    };
+  }
+
   async function setComposerText(operation, target, text, { allowFocus = true } = {}) {
     if (!target || target !== composer || !target.isConnected) {
       return { ok: false, code: "target_changed", focusUsed: false };
@@ -1547,28 +1709,19 @@
     const operationEpoch = targetEpoch;
     const operationGeneration = lifecycleGeneration;
     const current = readComposerText(targetElement);
-    if (protectedComposerNode(targetElement)) {
-      return rejectResult(
-        resultType,
-        message.requestId,
-        "protected_content_present",
-        "Claude 输入框中含有附件、图片或不可安全替换的富文本节点；未执行自动写入"
-      );
-    }
-    if (pluginOwned && current !== normalizeText(lastWritten)) {
-      if (!current) {
-        // The composer emptied between a page-side clear (a send or a manual
-        // wipe) and the queued reconcile. Let the pending send intent decide
-        // between SEND_CONFIRMED and TARGET_CLEARED instead of destroying it
-        // as a zero-length "manual edit".
-        confirmClear(lastObservedText || normalizeText(lastWritten));
-        return rejectResult(resultType, message.requestId, "target_cleared", "写入前发现输入框已被清空，未执行写入");
-      }
-      reportManualEdit(current);
-      return rejectResult(resultType, message.requestId, "manual_edit", "检测到人工修改，未覆盖");
-    }
-    if (current && !pluginOwned && !message.force) {
-      return rejectResult(resultType, message.requestId, "manual_edit", "Claude 输入框已有非插件内容，未覆盖");
+    // 0.2.15 append contract: existing composer content is never inspected for
+    // ownership and never removed. The translation is appended after whatever
+    // is there; only the plugin's own previous segment is replaced, and only
+    // while it is still intact at the very end. Attachments no longer block the
+    // write — the selection covers our own trailing characters and nothing
+    // else, so atomic nodes are outside every range we touch.
+    if (pluginOwned && !current) {
+      // The composer emptied between a page-side clear (a send or a manual
+      // wipe) and the queued reconcile. Let the pending send intent decide
+      // between SEND_CONFIRMED and TARGET_CLEARED instead of destroying it as
+      // a zero-length "manual edit".
+      confirmClear(lastObservedText || normalizeText(lastWritten));
+      return rejectResult(resultType, message.requestId, "target_cleared", "写入前发现输入框已被清空，未执行写入");
     }
 
     const text = String(message.text ?? "");
@@ -1578,12 +1731,13 @@
     // plain external clear. The intent is cleared on success below.
     const previousExpectedWriteText = expectedWriteText;
     const previousSuppressUntil = suppressUntil;
-    expectedWriteText = text;
+    const plan = appendPlan(targetElement, text);
+    expectedWriteText = plan.expected;
     suppressUntil = performance.now() + 900;
-    const operation = beginMutation(targetElement, current, text);
+    const operation = beginMutation(targetElement, current, plan.expected);
     let writeResult;
     try {
-      writeResult = await setComposerText(operation, targetElement, text, {
+      writeResult = await appendComposerText(operation, targetElement, plan, {
         allowFocus: message.allowFocus === true
       });
     } finally {
@@ -1632,7 +1786,9 @@
     }
 
     const readback = readComposerText(targetElement);
-    if (!writeResult?.ok || readback !== normalizeText(text)) {
+    // The composer must now hold the user's untouched prefix plus our new
+    // segment — not the translation alone.
+    if (!writeResult?.ok || readback !== plan.expected) {
       if (writeResult?.code === "focus_write_disabled") {
         // The DOM was never touched; restore the pre-attempt suppression state.
         expectedWriteText = previousExpectedWriteText;
@@ -1652,9 +1808,12 @@
     clearSendIntent();
     preferredStrategy = writeResult.strategy;
     targetEpoch += 1;
-    lastWritten = normalizeText(text);
+    lastWritten = plan.expected;
     lastObservedText = lastWritten;
     pluginOwned = true;
+    // Remember exactly what we appended so the next translation replaces that
+    // and only that, instead of appending a second copy.
+    appendedText = text;
     post({
       type: resultType,
       requestId: message.requestId,
@@ -1707,6 +1866,14 @@
     if (enforceOwnership && (!pluginOwned || current !== normalizeText(lastWritten))) {
       return rejectResult(resultType, message.requestId, "not_plugin_owned", "当前内容不是插件的最后写入值");
     }
+    // 0.2.15: under the append contract the plugin "owns" only its trailing
+    // segment, not the whole composer. An owned clear must therefore remove
+    // that segment alone — emptying the editor here would delete the user's
+    // own text, which is precisely what this command exists to avoid.
+    const ownedTailOnly = enforceOwnership && appendedText && current !== appendedText;
+    const clearTarget = ownedTailOnly
+      ? normalizeText(current.slice(0, current.length - appendedText.length))
+      : "";
 
     // Arm the self-echo suppression only for the duration of this attempt.
     // Every failure path below must disarm (or restore) it: a leftover empty
@@ -1716,14 +1883,26 @@
     // by this operation.
     const previousExpectedWriteText = expectedWriteText;
     const previousSuppressUntil = suppressUntil;
-    expectedWriteText = "";
+    expectedWriteText = clearTarget;
     suppressUntil = performance.now() + 900;
-    const operation = beginMutation(targetElement, current, "");
+    const operation = beginMutation(targetElement, current, clearTarget);
     let clearResult;
     try {
-      clearResult = await setComposerText(operation, targetElement, "", {
-        allowFocus: message.allowFocus === true
-      });
+      clearResult = ownedTailOnly
+        ? await appendComposerText(
+            operation,
+            targetElement,
+            {
+              ownedLength: appendedText.length,
+              prefixNodeChars: 0,
+              addition: "",
+              expected: clearTarget
+            },
+            { allowFocus: message.allowFocus === true }
+          )
+        : await setComposerText(operation, targetElement, "", {
+            allowFocus: message.allowFocus === true
+          });
     } finally {
       endMutation(operation);
     }
@@ -1775,7 +1954,7 @@
       );
     }
 
-    if (!clearResult?.ok || readComposerText(targetElement) !== "") {
+    if (!clearResult?.ok || readComposerText(targetElement) !== clearTarget) {
       // The DOM was not modified (e.g. focus_write_disabled) or still holds
       // text; restore the pre-attempt suppression state so the old draft's
       // eventual real send is reported normally.
@@ -1794,9 +1973,12 @@
 
     clearSendIntent();
     targetEpoch += 1;
-    lastWritten = "";
-    lastObservedText = "";
+    // A tail-only clear leaves the user's own text behind; it is theirs, so the
+    // plugin owns nothing afterwards either way.
+    lastWritten = clearTarget;
+    lastObservedText = clearTarget;
     pluginOwned = false;
+    appendedText = "";
     post({
       type: resultType,
       requestId: message.requestId,

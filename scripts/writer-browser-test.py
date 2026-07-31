@@ -249,7 +249,9 @@ def main() -> None:
             "window.__writerHarness.messages.findLast(message => message.type === 'SEND_CONFIRMED')"
         )
         navigation_messages = page.evaluate("window.__writerHarness.messages")
-        assert confirmed and confirmed["sentText"] == "to send", navigation_messages
+        # v0.2.15 append contract: the user's own text stays and the translation
+        # lands after it, so the confirmed send carries the combined message.
+        assert confirmed and confirmed["sentText"] == "plugin user\n\nto send", navigation_messages
         navigation_clear_events = [
             message for message in navigation_messages
             if message.get("type") in ("SEND_CONFIRMED", "TARGET_CLEARED")
@@ -387,9 +389,13 @@ def main() -> None:
                 "deadline": 2**53 - 1,
             },
         )
-        assert attachment_write["code"] == "protected_content_present", attachment_write
-        assert attachment_page.locator("#editor [data-attachment]").count() == 1
-        assert attachment_page.locator("#editor").inner_text() == ""
+        # v0.2.15: an attachment no longer blocks the write. Append mode only
+        # ever selects the plugin's own trailing characters, so the chip is
+        # outside every range touched and must still be there afterwards.
+        assert attachment_write["ok"] is True, attachment_write
+        assert attachment_page.locator("#editor [data-attachment]").count() == 1, \
+            "the attachment chip was destroyed by an append"
+        assert "must not delete attachment" in attachment_page.locator("#editor").inner_text()
         attachment_page.close()
 
         attachment_clear_page = browser.new_page(viewport={"width": 1200, "height": 800})
@@ -477,7 +483,12 @@ def main() -> None:
                 "deadline": 2**53 - 1,
             },
         )
-        assert late_result["code"] == "write_failed_not_restored", late_result
+        # v0.2.15: append mode has nothing to roll back — it only ever added
+        # characters — so content drifting in mid-write surfaces as a plain
+        # readback failure instead of a rollback. What matters is unchanged:
+        # the write is not reported as synced and nothing of the page is lost.
+        assert late_result["ok"] is False, late_result
+        assert late_result["code"] in {"write_failed", "write_failed_not_restored"}, late_result
         assert late_attachment_page.evaluate("window.__execCalls") == 1
         assert late_attachment_page.locator("#editor [data-attachment='late-file']").count() == 1
         assert "drift" in late_attachment_page.locator("#editor").inner_text()
@@ -688,23 +699,35 @@ def main() -> None:
                 "deadline": 2**53 - 1,
             },
         )
-        assert not refused_write["ok"] and refused_write["code"] == "manual_edit", refused_write
-        assert hero_page.locator("#editor").inner_text() == "user note"
+        # v0.2.15 replaces the 0.2.12 refusal with an append: the user's own
+        # text is still never lost, it simply keeps company rather than
+        # blocking the translation.
+        assert refused_write["ok"] is True, refused_write
+        assert refused_write["readback"] == "user note\n\ntranslation", refused_write
+        appended_text = hero_page.locator("#editor").inner_text()
+        assert appended_text.startswith("user note"), appended_text
+        assert "translation" in appended_text, appended_text
 
-        refused_clear = send(
+        # v0.2.15: an owned clear removes the plugin's appended tail and only
+        # that. The user's own text must survive it — this is the zero-deletion
+        # guarantee restated for append mode.
+        owned_clear = send(
             hero_page,
             {
                 "type": "CLEAR_TARGET_IF_OWNED",
-                "requestId": "hero-clear-refused",
+                "requestId": "hero-clear-owned-tail",
                 "lease": "lease-hero",
                 "expectedWriterSession": hero_session,
-                "expectedTargetEpoch": hero_epoch,
+                "expectedTargetEpoch": refused_write["targetEpoch"],
                 "allowFocus": True,
                 "deadline": 2**53 - 1,
             },
         )
-        assert not refused_clear["ok"] and refused_clear["code"] == "not_plugin_owned", refused_clear
-        assert hero_page.locator("#editor").inner_text() == "user note"
+        assert owned_clear["ok"] is True, owned_clear
+        after_owned_clear = hero_page.locator("#editor").inner_text()
+        assert "user note" in after_owned_clear, after_owned_clear
+        assert "translation" not in after_owned_clear, after_owned_clear
+        hero_epoch = owned_clear["targetEpoch"]
 
         forced_clear = send(
             hero_page,

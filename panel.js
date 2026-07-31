@@ -1256,21 +1256,9 @@ function updateTargetFromWriterState(message) {
   state.target.currentText = String(writerState.currentText ?? state.target.currentText ?? "");
   state.target.connected = true;
   updateTargetUI();
-  if (
-    state.target.currentText
-    && !state.target.pluginOwned
-    && state.targetPhase !== "manual"
-    && state.targetPhase !== "syncing"
-  ) {
-    // v0.2.12: pre-existing user content in the composer is a NORMAL state,
-    // not a conflict. Adopt the protective "manual" phase quietly — no banner,
-    // no pause, no overwrite prompt. Auto-sync degrades to preview; the
-    // explicit 同步(覆盖) and 清空输入框 buttons are the only ways to touch it.
-    state.manualText = state.target.currentText;
-    state.targetPhase = "manual";
-    setStatus("Claude 输入框中已有内容；新译文只停在预览，需要时点“同步到 Claude”覆盖或用“清空输入框”", "idle");
-    updateDraftUI();
-  }
+  // v0.2.15: pre-existing composer content no longer diverts the flow at all.
+  // The translation is appended after it and the user's text is never touched,
+  // so there is nothing to protect against and nothing to ask about.
   renderDiagnostics();
 }
 
@@ -1356,9 +1344,7 @@ function handlePanelMessage(message) {
         requiresFocusWrite: Boolean(message.requiresFocusWrite),
         currentText: String(message.currentText ?? "")
       };
-      if (state.target.currentText && !state.target.pluginOwned) {
-        showManualBanner(state.target.currentText);
-      } else {
+      {
         hideManualBanner();
         // Plugin-owned text is only "synced" when it matches the English for
         // the current Chinese revision. A rebind must not flip stale content

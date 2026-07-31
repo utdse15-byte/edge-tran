@@ -83,9 +83,22 @@ for (const required of [
   "activeMutation",
   "validateExpectedState",
   "history.pushState() does not emit popstate",
-  "insertLineBreak"
+  "insertLineBreak",
+  // 0.2.15 append contract: the plugin may only ever select its own trailing
+  // segment. Losing any of these means a write could once again put the user's
+  // own composer content inside a replaced range.
+  "function selectTrailingChars",
+  "function nodeTextOf",
+  "function appendPlan",
+  "appendedText = text;"
 ]) {
   if (!writerText.includes(required)) throw new Error(`Writer safety invariant missing: ${required}`);
+}
+// selectEditorContents() selects EVERYTHING; under the append contract it is
+// legal only for the explicit user-pressed 清空输入框 button.
+const selectAllUses = (writerText.match(/selectEditorContents\(/g) ?? []).length;
+if (selectAllUses > 2) {
+  throw new Error(`select-all is reachable from ${selectAllUses} sites; append mode allows only the forced clear`);
 }
 
 const storageText = await readFile(path.join(root, "lib/storage.js"), "utf8");
