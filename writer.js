@@ -42,6 +42,13 @@
   // and is never selected, replaced or deleted. Empty when the plugin has
   // nothing of its own in the composer.
   let appendedText = "";
+  // Length of that segment measured in TEXT-NODE characters. It differs from
+  // appendedText.length whenever the translation spans blocks: serialization
+  // synthesises a newline at every block boundary and those newlines live in no
+  // text node. Identity is checked on the normalized text; the selection is
+  // sized in node characters. Conflating the two made every multi-paragraph
+  // translation fail its ownership check and stack a fresh copy each time.
+  let appendedNodeChars = 0;
   let suppressUntil = 0;
   let expectedWriteText = "";
   let sendIntent = null;
@@ -1343,6 +1350,7 @@
   // boundary, and those newlines exist in no text node. Sizing a selection
   // with serialized lengths walks too far back and eats the user's characters.
   function nodeTextOf(element) {
+    if (isTextControl(element)) return String(element.value ?? "");
     const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
     let out = "";
     let node;
@@ -1544,21 +1552,12 @@
   // and the next translation is appended after it rather than replacing it.
   function appendPlan(element, text) {
     const current = readComposerText(element);
-    // A text control's value lives on the element, not in child text nodes —
-    // walking the DOM there returns the original markup, never the typed text.
-    const nodeText = isTextControl(element)
-      ? String(element.value ?? "")
-      : nodeTextOf(element);
+    const nodeText = nodeTextOf(element);
     // Our segment is still ours only while it sits untouched at the very end,
     // in both the normalized view and the raw text nodes. One keystroke inside
     // it and the whole composer counts as the user's, so the next translation
     // is appended after it rather than replacing it.
-    const owned = Boolean(
-      pluginOwned
-      && appendedText
-      && nodeText.endsWith(appendedText)
-      && current.endsWith(appendedText)
-    );
+    const owned = Boolean(pluginOwned && appendedText && current.endsWith(appendedText));
 
     if (owned) {
       // The separator already exists in the DOM as block structure, which is
@@ -1566,8 +1565,8 @@
       // Re-inserting it would stack another blank line on every retranslation.
       const base = current.slice(0, current.length - appendedText.length);
       return {
-        ownedLength: appendedText.length,
-        prefixNodeChars: nodeText.length - appendedText.length,
+        ownedLength: appendedNodeChars,
+        prefixNodeChars: nodeText.length - appendedNodeChars,
         addition: text,
         expected: normalizeText(base + text)
       };
@@ -1813,7 +1812,8 @@
     pluginOwned = true;
     // Remember exactly what we appended so the next translation replaces that
     // and only that, instead of appending a second copy.
-    appendedText = text;
+    appendedText = normalizeText(text);
+    appendedNodeChars = Math.max(0, nodeTextOf(targetElement).length - plan.prefixNodeChars);
     post({
       type: resultType,
       requestId: message.requestId,
@@ -1979,6 +1979,7 @@
     lastObservedText = clearTarget;
     pluginOwned = false;
     appendedText = "";
+    appendedNodeChars = 0;
     post({
       type: resultType,
       requestId: message.requestId,

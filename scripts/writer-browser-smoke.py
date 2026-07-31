@@ -72,6 +72,23 @@ with sync_playwright() as p:
   assert sent and sent['sentText']=='plugin user\n\nto send' and sent['targetEpoch']==epoch+1, page.evaluate('window.__h.messages')
   page.close()
 
+  # Append mode: a MULTI-PARAGRAPH translation must be replaced on the next
+  # translation, not stacked. Regression for the ownership check being done on
+  # concatenated text nodes, which omit the newline synthesised at every block
+  # boundary and therefore never matched a multi-line tail.
+  page=b.new_page(viewport={'width':1200,'height':800}); hello=setup(page,'ce'); ws=hello['writerSession']
+  page.locator('#editor').click(); page.keyboard.type('user note')
+  page.wait_for_timeout(120)
+  ep=page.evaluate('window.__h.messages.findLast(m=>m.type==="WRITER_STATE").state.targetEpoch')
+  r=send(page, {'type':'WRITE_TARGET','requestId':'ml1','lease':'L','text':'One.\nTwo.\n\nThree.','expectedWriterSession':ws,'expectedTargetEpoch':ep,'allowFocus':True}, wait=150)
+  assert r['ok'], r
+  r=send(page, {'type':'WRITE_TARGET','requestId':'ml2','lease':'L','text':'Fresh.\nLines.','expectedWriterSession':ws,'expectedTargetEpoch':r['targetEpoch'],'allowFocus':True}, wait=150)
+  assert r['ok'], r
+  composed=page.locator('#editor').evaluate('(e)=>e.innerText')
+  assert composed.startswith('user note'), composed
+  assert 'Fresh.' in composed and 'One.' not in composed, f"multi-line tail stacked instead of being replaced: {composed!r}"
+  page.close()
+
   # textarea exact blank lines, no focus needed
   page=b.new_page(viewport={'width':1200,'height':800}); hello=setup(page,'ta'); ws=hello['writerSession']
   r=send(page, {'type':'WRITE_TARGET','requestId':'tw','lease':'L','text':'x\n\n\ny','expectedWriterSession':ws,'expectedTargetEpoch':0,'allowFocus':False})

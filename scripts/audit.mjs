@@ -90,7 +90,11 @@ for (const required of [
   "function selectTrailingChars",
   "function nodeTextOf",
   "function appendPlan",
-  "appendedText = text;"
+  "appendedText = normalizeText(text)",
+  // Identity is checked on normalized text, the selection is sized in
+  // text-node characters. Conflating the two made every multi-paragraph
+  // translation stack a fresh copy instead of replacing the previous one.
+  "appendedNodeChars"
 ]) {
   if (!writerText.includes(required)) throw new Error(`Writer safety invariant missing: ${required}`);
 }
