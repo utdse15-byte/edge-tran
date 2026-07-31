@@ -54,6 +54,7 @@ import {
 import {
   BACK_TRANSLATION_MODES,
   STORAGE_KEYS,
+  composerCarriesEnglish,
   isCurrentDraftSend,
   isEnglishRevisionCurrent,
   normalizeText,
@@ -2719,4 +2720,36 @@ test("strict review gate setting normalizes to a boolean and defaults off", () =
   assert.equal(normalizeStoredSettings({}).strictReviewGate, false);
   assert.equal(normalizeStoredSettings({ strictReviewGate: true }).strictReviewGate, true);
   assert.equal(normalizeStoredSettings({ strictReviewGate: "yes" }).strictReviewGate, false);
+});
+
+test("append contract: composer suffix comparisons replace equality", () => {
+  // v0.2.15 appends the translation after the user's own text, so the composer
+  // (and the sent message) ends with the English instead of equalling it.
+  assert.equal(composerCarriesEnglish("我的笔记\n\nHello there", "Hello there"), true);
+  assert.equal(composerCarriesEnglish("Hello there", "Hello there"), true);
+  assert.equal(composerCarriesEnglish("Hello there\n\n我的笔记", "Hello there"), false);
+  assert.equal(composerCarriesEnglish("anything", ""), false, "an empty English must never match");
+  assert.equal(composerCarriesEnglish("", "Hello"), false);
+
+  // A send of the composed message still archives the current draft.
+  assert.equal(isCurrentDraftSend({
+    sentText: "user note\n\nCurrent English",
+    draftEnglish: "Current English",
+    englishSourceRevision: 4,
+    sourceRevision: 4
+  }), true);
+  // A stale revision still does not.
+  assert.equal(isCurrentDraftSend({
+    sentText: "user note\n\nCurrent English",
+    draftEnglish: "Current English",
+    englishSourceRevision: 3,
+    sourceRevision: 4
+  }), false);
+  // Text that merely contains the English mid-message is not our send.
+  assert.equal(isCurrentDraftSend({
+    sentText: "Current English then the user kept typing",
+    draftEnglish: "Current English",
+    englishSourceRevision: 4,
+    sourceRevision: 4
+  }), false);
 });

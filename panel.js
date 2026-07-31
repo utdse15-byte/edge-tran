@@ -5,6 +5,7 @@ import {
   STORAGE_KEYS,
   clone,
   clampInteger,
+  composerCarriesEnglish,
   isCurrentDraftSend,
   isEnglishRevisionCurrent,
   isClaudeUrl,
@@ -1352,7 +1353,7 @@ function handlePanelMessage(message) {
         // scheduled auto-clear that the rebind's abortInFlight cancelled.
         const englishCurrent = Boolean(state.draft.english)
           && state.draft.englishSourceRevision === state.sourceRevision
-          && normalizeText(state.target.currentText) === normalizeText(state.draft.english);
+          && composerCarriesEnglish(state.target.currentText, state.draft.english);
         state.targetPhase = state.target.pluginOwned
           ? (englishCurrent ? "synced" : (state.target.currentText ? "stale-uncleared" : "empty"))
           : "empty";
@@ -1442,7 +1443,7 @@ function handlePanelMessage(message) {
       {
         abortInFlight();
         const sentText = String(message.sentText ?? "");
-        const sentMatchesPreview = normalizeText(sentText) === normalizeText(state.draft.english);
+        const sentMatchesPreview = composerCarriesEnglish(sentText, state.draft.english);
         const sentMatchesManualTarget =
           state.targetPhase === "manual"
           && normalizeText(sentText) === normalizeText(state.target.currentText);

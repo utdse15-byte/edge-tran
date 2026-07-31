@@ -686,6 +686,40 @@ def main() -> None:
         )
         page.close()
 
+        # --- 5n. append contract: badge and send-archive still work ---------
+        # The composer now ENDS WITH the translation instead of equalling it,
+        # so every "is this our text" comparison had to become a suffix test.
+        # Miss one and the badge never turns 已同步 and a sent draft is never
+        # archived.
+        gateway.reset()
+        page, errors = open_panel(
+            browser, harness, extension_mock(harness, gateway.base_url('ok'))
+        )
+        bind_target(page)
+        page.evaluate("window.__mock.writer.text = '我自己的笔记'")
+        set_source(page, '请帮我检查这段代码的性能问题。')
+        translate_now(page)
+        page.wait_for_function(
+            "window.__mock.writer.text.includes('please help me review this snippet')",
+            timeout=20000,
+        )
+        composed = page.evaluate('window.__mock.writer.text')
+        assert composed.startswith('我自己的笔记'), composed
+        page.wait_for_function(
+            "document.querySelector('#syncBadge').textContent.includes('已同步')",
+            timeout=15000,
+        )
+
+        # Sending the composed message must archive the draft and start a new one.
+        page.evaluate("() => {\n  const writer = window.__mock.writer;\n  const sent = writer.text;\n  writer.text = '';\n  writer.pluginOwned = false;\n  writer.ownedTail = '';\n  writer.epoch += 1;\n  window.__mock.emit({\n    type: 'SEND_CONFIRMED', tabId: writer.tabId,\n    writerSession: writer.session, targetEpoch: writer.epoch,\n    sentText: sent, intentKind: 'button'\n  });\n}")
+        page.wait_for_function(
+            "document.querySelector('#sourceText').value === ''", timeout=15000
+        )
+        assert errors == [], errors
+        observed.append(
+            f'append badge+archive: composer={composed[:34]!r}, draft archived after send'
+        )
+        page.close()
         # --- 6. model detection populates the picker ------------------------
         page, errors = open_panel(
             browser, harness, extension_mock(harness, gateway.base_url("ok"))
