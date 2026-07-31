@@ -19,6 +19,19 @@
 - `<textarea>` 的值不在子文本节点里,所有权比对必须读 `.value`,否则永远匹配不上、每次都追加。
 - 审计新增锚点:`selectTrailingChars`/`nodeTextOf`/`appendPlan` 必须存在,且全选 `selectEditorContents(` 的调用点不得超过 2 处(只允许显式"清空输入框"按钮用)。
 
+### Gemini Live 免费额度桥接(新增工具,插件零改动)
+
+Gemini 免费档普通模型只有个位数到 15 次/天,**Live API 模型不限次数**、只限 token。新增 `scripts/gemini-live-bridge.mjs`(`npm run gemini:live`):对插件说 OpenAI Chat Completions,对 Google 说 Live API。插件一行都不用改——manifest 本来就允许 `http://127.0.0.1:*`,真 Key 留在桥接进程里不进插件存储。
+
+可行性建立在两条实测结论上,不是推测:
+
+- Live 模型**接受纯文字输入**,不需要麦克风(三种 Live 模型逐一验证)。
+- `outputAudioTranscription` 回传的是**合成语音所依据的那份文本**,不是声波识别。实测占位符 `⟦ZH2EN_…⟧`、URL、反引号命令、`/etc/hosts`、`v2.1.0`、`85%`、空行分段全部原样保留;用插件真实的系统提示词跑,直接产出四字段齐全的严格 JSON。用真实 `lib/translator.js` 端到端验证:0.7–1.2 秒返回,受保护内容零损伤。
+
+模型只有 `gemini-3.1-flash-live-preview` 三项全合格。`gemini-2.5-flash-native-audio-*` 对 JSON 提示词返回空;`gemini-3.5-live-translate-preview` 只吃语音,纯文字输入毫无响应(它是语音翻译模型)。
+
+**会话复用是个反直觉的坑,已按实测放弃**:本以为复用会话能把系统提示词摊销掉,实测同一会话三轮的 prompt token 是 586 / 767 / 1039(历史在累积),而每次新开会话恒定约 586——第二轮起复用就更贵。桥接默认每次请求新开会话(约 90ms 建连),`--reuse-turns N` 保留给确实需要上下文的场景。
+
 ### 测试
 
 - writer 与 panel 四个浏览器套件里编码旧覆盖契约的断言全部按新契约重写(不是删掉):用户文字保留、发送内容包含两段、附件存活、所有权清理只删自己那段、人工编辑后追加而非覆盖。

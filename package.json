@@ -10,6 +10,7 @@
     "verify": "npm run check && npm test && npm run audit",
     "mock:provider": "node scripts/mock-provider.mjs --port 8787",
     "smoke:browser": "python3 scripts/writer-browser-smoke.py && python3 scripts/writer-browser-test.py && python3 scripts/panel-browser-smoke.py && python3 scripts/panel-browser-test.py && python3 scripts/panel-live-provider-test.py",
-    "verify:full": "npm run verify && npm run smoke:browser"
+    "verify:full": "npm run verify && npm run smoke:browser",
+    "gemini:live": "node scripts/gemini-live-bridge.mjs --port 8788"
   }
 }

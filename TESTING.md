@@ -204,6 +204,24 @@ npm run mock:provider          # 监听 http://127.0.0.1:8787
 - [ ] 漏 `/v1` 前缀：提示 Base URL 很可能缺少 API 前缀。
 - [ ] 诊断日志与状态栏中不出现 API Key、提示词或完整响应正文。
 
+## Gemini Live 免费额度桥接（0.2.15+）
+
+Gemini 免费档里普通模型只有个位数到 15 次/天，**Live API 模型不限次数**、只限 token。Live API 是语音用的双向 WebSocket，插件不能直连；但实测两点让它可用：Live 模型接受**纯文字**输入（不需要麦克风），而 `outputAudioTranscription` 回传的是**合成语音所依据的那份文本**（不是声波识别），实测占位符 `⟦ZH2EN_…⟧`、URL、反引号命令、路径、版本号、百分比、空行分段全部原样保留，也能满足插件的严格 JSON 契约。
+
+```
+GEMINI_API_KEY=AIza... npm run gemini:live      # 监听 http://127.0.0.1:8788
+```
+
+侧栏设置里：Base URL 填 `http://127.0.0.1:8788/v1`，模型填 `gemini-3.1-flash-live-preview`，**API Key 随便填**（真 Key 在桥接进程里，不进插件存储）。插件代码零改动——manifest 本来就允许 `http://127.0.0.1:*`。
+
+- [ ] 正常翻译：约 0.7–1.2 秒返回，英文与中文回译都正确。
+- [ ] 含 URL / 反引号命令 / `/etc/hosts` 的草稿：受保护内容原样保留。
+- [ ] 流式预览开启时正常工作（转写通常一次到齐，预览帧较少）。
+
+实测 token：每次翻译约 590–670 prompt tokens（系统提示词占大头）。**不要开会话复用**——Live 会话会累积对话历史，实测同一会话三轮是 586 / 767 / 1039，而每次新开会话恒定约 586，第二轮起复用就更贵了。桥接默认每次请求新开会话（约 90ms 建连）。想省一半 token 可以在设置里选"关闭回译"。
+
+模型选择：`gemini-3.1-flash-live-preview` 是唯一三项都合格的（接受文字输入、能出严格 JSON、保真）。`gemini-2.5-flash-native-audio-*` 对 JSON 提示词返回空；`gemini-3.5-live-translate-preview` 只吃语音，纯文字输入毫无响应。
+
 ## 自动化套件说明
 
 - `npm run verify` 只含 Node 测试、语法检查（含 `.mjs`）与静态审计。
