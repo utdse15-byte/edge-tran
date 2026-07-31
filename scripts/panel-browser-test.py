@@ -510,9 +510,12 @@ def main() -> None:
           window.__mock.emit({
             type: 'TARGET_MANUAL_EDIT', tabId: window.__mock.writer.tabId,
             writerSession: window.__mock.writer.session,
-            targetEpoch: window.__mock.writer.epoch, text: window.__mock.writer.text
+            targetEpoch: window.__mock.writer.epoch, text: window.__mock.writer.text,
+            reason: 'write_interrupted'
           });
         """)
+        # v0.2.15: only an interrupted write raises the banner. An ordinary
+        # composer edit is a normal event and stays silent.
         page.wait_for_function("!document.querySelector('#manualBanner').classList.contains('hidden')", timeout=10000)
 
         # An external clear must remove the stale manual-edit banner rather than

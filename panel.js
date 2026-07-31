@@ -1415,8 +1415,20 @@ function handlePanelMessage(message) {
       state.target.targetEpoch = message.targetEpoch ?? state.target.targetEpoch + 1;
       state.target.pluginOwned = false;
       state.target.currentText = String(message.text ?? "");
-      showManualBanner(message.text);
-      addDiagnostic("检测到 Claude 输入框被人工修改，已暂停自动覆盖");
+      // v0.2.15: editing the composer is an ordinary thing to do. Nothing is
+      // at risk any more — the next translation is appended after whatever is
+      // there, never over it — so an ordinary edit must not abort the request
+      // in flight, must not pause automation and must not raise the conflict
+      // banner. A write that was interrupted midway is still an incident: it
+      // may have left a partial insertion, and that does warrant a stop.
+      if (message.reason === "write_interrupted" || message.reason === "clear_interrupted") {
+        showManualBanner(message.text);
+        addDiagnostic("写入过程被打断，已暂停自动覆盖，请核对 Claude 输入框");
+      } else {
+        state.targetPhase = state.target.currentText ? "stale-uncleared" : "empty";
+        updateTargetUI();
+        updateDraftUI();
+      }
       break;
     case "TARGET_WRITE_RECOVERY_FAILED":
       state.target.targetEpoch = message.targetEpoch ?? state.target.targetEpoch + 1;

@@ -546,7 +546,12 @@
       type: "TARGET_MANUAL_EDIT",
       writerSession,
       targetEpoch,
-      text: normalized
+      text: normalized,
+      // The panel needs to tell an ordinary edit apart from a write that was
+      // interrupted midway. Under the append contract the former is a normal
+      // event (the next translation simply goes after it) while the latter is
+      // an incident that may have left a partial insertion behind.
+      reason
     });
     sendState(reason);
   }

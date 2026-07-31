@@ -720,6 +720,41 @@ def main() -> None:
             f'append badge+archive: composer={composed[:34]!r}, draft archived after send'
         )
         page.close()
+        # --- 5o. editing the composer is ordinary; only incidents stop us ---
+        # Under append nothing is at risk when the user types, so an ordinary
+        # edit must not abort the in-flight request, pause automation or raise
+        # the conflict banner. An interrupted write still must.
+        gateway.reset()
+        page, errors = open_panel(
+            browser, harness, extension_mock(harness, gateway.base_url('ok'))
+        )
+        bind_target(page)
+        set_source(page, '请帮我检查这段代码的性能问题。')
+        translate_now(page)
+        page.wait_for_function(
+            "window.__mock.writer.text.includes('please help me review this snippet')",
+            timeout=20000,
+        )
+        page.evaluate("() => {\n  const writer = window.__mock.writer;\n  writer.text = writer.text + ' 我又补了一句';\n  writer.pluginOwned = false;\n  writer.ownedTail = '';\n  writer.epoch += 1;\n  window.__mock.emit({\n    type: 'TARGET_MANUAL_EDIT', tabId: writer.tabId,\n    writerSession: writer.session, targetEpoch: writer.epoch,\n    text: writer.text, reason: 'manual_edit'\n  });\n}")
+        page.wait_for_timeout(400)
+        banner_class = page.get_attribute('#manualBanner', 'class') or ''
+        assert 'hidden' in banner_class.split(), 'an ordinary composer edit raised the conflict banner'
+        assert page.inner_text('#pauseButton') == '暂停', 'an ordinary composer edit paused automation'
+        quiet_status = status_text(page)
+        assert '人工修改' not in quiet_status, quiet_status
+
+        # A genuine write incident still stops everything.
+        page.evaluate("() => {\n  const writer = window.__mock.writer;\n  writer.epoch += 1;\n  window.__mock.emit({\n    type: 'TARGET_MANUAL_EDIT', tabId: writer.tabId,\n    writerSession: writer.session, targetEpoch: writer.epoch,\n    text: writer.text, reason: 'write_interrupted'\n  });\n}")
+        page.wait_for_function(
+            "!document.querySelector('#manualBanner').classList.contains('hidden')",
+            timeout=15000,
+        )
+        assert page.inner_text('#pauseButton') == '恢复', 'a write incident must pause automation'
+        assert errors == [], errors
+        observed.append(
+            f'manual edit quiet={quiet_status.strip()[:26]!r}; write incident still pauses'
+        )
+        page.close()
         # --- 6. model detection populates the picker ------------------------
         page, errors = open_panel(
             browser, harness, extension_mock(harness, gateway.base_url("ok"))
