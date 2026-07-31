@@ -751,6 +751,32 @@ def main() -> None:
         )
         assert page.inner_text('#pauseButton') == '恢复', 'a write incident must pause automation'
         assert errors == [], errors
+        page.close()
+
+        # And the loop still closes: after an ordinary edit a NEW translation
+        # must still be written, appended after what the user added.
+        gateway.reset()
+        page, errors = open_panel(
+            browser, harness, extension_mock(harness, gateway.base_url('ok'))
+        )
+        bind_target(page)
+        set_source(page, '请帮我检查这段代码的性能问题。')
+        translate_now(page)
+        page.wait_for_function(
+            "window.__mock.writer.text.includes('please help me review this snippet')",
+            timeout=20000,
+        )
+        page.evaluate("() => {\n  const writer = window.__mock.writer;\n  writer.text = writer.text + ' 我又补了一句';\n  writer.pluginOwned = false;\n  writer.ownedTail = '';\n  writer.epoch += 1;\n  window.__mock.emit({\n    type: 'TARGET_MANUAL_EDIT', tabId: writer.tabId,\n    writerSession: writer.session, targetEpoch: writer.epoch,\n    text: writer.text, reason: 'manual_edit'\n  });\n}")
+        page.wait_for_timeout(300)
+        set_source(page, '请帮我修复部署失败的日志。')
+        translate_now(page)
+        page.wait_for_function(
+            "window.__mock.writer.text.includes('deploy')", timeout=20000
+        )
+        final = page.evaluate('window.__mock.writer.text')
+        assert '我又补了一句' in final, f'the user addition was lost: {final!r}'
+        observed.append(f'edit then retranslate: composer={final[-60:]!r}')
+        assert errors == [], errors
         observed.append(
             f'manual edit quiet={quiet_status.strip()[:26]!r}; write incident still pauses'
         )
