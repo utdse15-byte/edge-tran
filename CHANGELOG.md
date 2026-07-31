@@ -48,6 +48,18 @@ Gemini 免费档普通模型只有个位数到 15 次/天,**Live API 模型不�
 
 **会话复用是个反直觉的坑,已按实测放弃**:本以为复用会话能把系统提示词摊销掉,实测同一会话三轮的 prompt token 是 586 / 767 / 1039(历史在累积),而每次新开会话恒定约 586——第二轮起复用就更贵。桥接默认每次请求新开会话(约 90ms 建连),`--reuse-turns N` 保留给确实需要上下文的场景。
 
+### 两个命令行入口在 Windows 上根本起不来(严重,你实测踩到)
+
+你在 `G:\edge-tran-main` 上跑 `npm run gemini:live`,只回显了 npm 横幅就退回提示符,插件报 `network_error`。原因不在你的环境:
+
+- **主模块判定在 Windows 上恒为假**。两个脚本都要区分"被当命令跑"和"被测试当库导入",原先用手拼的 `` `file://${process.argv[1]}` `` 去比 `import.meta.url`。POSIX 下碰巧相等,Windows 下 `process.argv[1]` 是 `G:\edge-tran-main\scripts\gemini-live-bridge.mjs`,而 `import.meta.url` 是 `file:///G:/edge-tran-main/scripts/gemini-live-bridge.mjs`——**永远不相等,整个 CLI 块一次都没执行**,进程零输出、退出码 0,看起来就像命令跑完了。修复:改用 `pathToFileURL(process.argv[1]).href`。`scripts/mock-provider.mjs` 同一处同一错,一并修掉。
+- 同一处还有两个跟进缺陷,是补测试时才暴露的:`pathToFileURL` **没有 import**(改完会变成 `ReferenceError`,比原来更糟);以及 `node -e` 和嵌入式场景下**根本没有 `argv[1]`**,`pathToFileURL(undefined)` 直接抛 `TypeError`,把模块导入整个打断。现在先判空再比较。
+- **源码里混进了一个字面 NUL 字节**(`gemini-live-bridge.mjs` 偏移 7296,在一处模板串里),编辑器看不见,却让 git 与 grep 把整个文件当二进制处理。
+
+新增 `tests/cli-entrypoints.test.js`(6 项):真的 `spawn` 两个脚本、等它打印监听横幅、再打一次 `/v1/models` 和一次翻译确认端口活着;断言缺 Key 时必须**非零退出且有提示**(静默 exit(0) 与这个 bug 无法区分);断言无 `argv[1]` 导入不报错、且导入不会顺带起服务。
+
+判定本身在 Linux 上无法复现 Windows 行为(拼串在 POSIX 恰好是对的),所以另加两道**静态防线**,审计里对每个源文件执行:禁止用拼串构造主模块判定、要求 `pathToFileURL` 已导入且判定容忍 `argv[1]` 缺失;禁止任何字面控制字节(制表/换行/回车除外)。三种回退写法与重新植入 NUL 均已逐一验证会被拦下。
+
 ### 测试
 
 - writer 与 panel 四个浏览器套件里编码旧覆盖契约的断言全部按新契约重写(不是删掉):用户文字保留、发送内容包含两段、附件存活、所有权清理只删自己那段、人工编辑后追加而非覆盖。

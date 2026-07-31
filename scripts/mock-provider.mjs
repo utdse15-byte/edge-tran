@@ -18,6 +18,7 @@
 // for, which is what the transport and validation layers are being tested on.
 
 import { createServer } from "node:http";
+import { pathToFileURL } from "node:url";
 import { gzipSync } from "node:zlib";
 
 // ---------------------------------------------------------------------------
@@ -1547,7 +1548,17 @@ export function startMockProvider({ port = 0, host = "127.0.0.1", log = false, r
 }
 
 // CLI mode: a gateway a human can point the real extension at.
-if (import.meta.url === `file://${process.argv[1]}`) {
+// pathToFileURL, not string concatenation: on Windows process.argv[1] is
+// `G:\dir\file.mjs` while import.meta.url is `file:///G:/dir/file.mjs`, so the
+// naive comparison is never true and the CLI block silently never runs — the
+// process just exits with no output at all.
+// argv[1] is absent under `node -e` and in embedders, where pathToFileURL
+// would throw on undefined; no argv[1] means we were not invoked as a script.
+const invokedAsScript = process.argv[1]
+  ? import.meta.url === pathToFileURL(process.argv[1]).href
+  : false;
+
+if (invokedAsScript) {
   const flag = (name, fallback) => {
     const index = process.argv.indexOf(`--${name}`);
     return index > 0 && process.argv[index + 1] ? process.argv[index + 1] : fallback;

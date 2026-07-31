@@ -62,6 +62,37 @@ for (const file of sourceFiles) {
   if (/\beval\s*\(/.test(text)) throw new Error(`eval found: ${file}`);
   if (/\bnew\s+Function\s*\(/.test(text)) throw new Error(`Function constructor found: ${file}`);
   if (/https?:\/\/[^\s"']+\.js\b/.test(text)) throw new Error(`remote script reference found: ${file}`);
+
+  // A literal control byte is invisible in an editor but makes git and grep
+  // treat the file as binary, which is how a stray NUL sat unnoticed inside a
+  // template literal in the Live bridge. Tab, LF and CR are the only ones a
+  // source file may hold; anything else must be written as an escape.
+  const controlByte = text.match(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/);
+  if (controlByte) {
+    const code = controlByte[0].charCodeAt(0).toString(16).padStart(4, "0");
+    throw new Error(`Literal control byte U+${code} at offset ${controlByte.index} in ${file} (write it as an escape)`);
+  }
+
+  // "Am I being run directly?" must go through pathToFileURL. Building the URL
+  // by hand works on POSIX and silently never matches on Windows, where argv[1]
+  // is `G:\dir\file.mjs` and import.meta.url is `file:///G:/dir/file.mjs` — the
+  // CLI block just never runs and the process exits with no output at all.
+  if (/`file:\/\/\$\{\s*process\.argv\[1\]\s*\}`/.test(text)) {
+    throw new Error(`Direct-invocation guard built by string concatenation in ${file}; use pathToFileURL(process.argv[1]).href`);
+  }
+  if (/import\.meta\.url\s*===/.test(text)) {
+    if (!/import\.meta\.url === pathToFileURL\(process\.argv\[1\]\)\.href/.test(text)) {
+      throw new Error(`Direct-invocation guard in ${file} must compare against pathToFileURL(process.argv[1]).href`);
+    }
+    if (!/import \{[^}]*\bpathToFileURL\b[^}]*\} from "node:url"/.test(text)) {
+      throw new Error(`${file} uses pathToFileURL without importing it from node:url`);
+    }
+    // argv[1] is absent under `node -e` and in embedders; an unguarded call
+    // turns every such import into a TypeError before anything else runs.
+    if (!/process\.argv\[1\]\s*\n?\s*\?/.test(text)) {
+      throw new Error(`Direct-invocation guard in ${file} must tolerate a missing process.argv[1]`);
+    }
+  }
 }
 
 const writerText = await readFile(path.join(root, "writer.js"), "utf8");
