@@ -1053,7 +1053,10 @@ function providerErrorMessage(error) {
     case "model_not_found":
       return "模型不存在、不可用，或当前 API Key 无权访问";
     case "incompatible_request":
-      return "模型或网关不兼容当前请求格式，请运行连通测试";
+      // The gateway's own wording is the only thing that distinguishes "wrong
+      // parameter" from "wrong API key" here — Google answers a bad key with
+      // HTTP 400 "Please pass a valid API key", not 401.
+      return `模型或网关不兼容当前请求格式，请运行连通测试${gatewayNote}`;
     case "payload_too_large":
       return "文本超过 Provider 限制";
     case "output_truncated":

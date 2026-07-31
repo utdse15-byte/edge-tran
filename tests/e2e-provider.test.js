@@ -996,6 +996,56 @@ test("a model list failure does not block a manually typed model id", async () =
 });
 
 // ---------------------------------------------------------------------------
+// Array-wrapped error envelopes (Google AI Studio's OpenAI-compat layer)
+// ---------------------------------------------------------------------------
+
+test("a wrong model id on an array-wrapping gateway is a model error, not a route error", async () => {
+  // Verified against the live endpoint: Google answers with
+  // [{"error":{"code":404,"message":"models/<id> is not found …"}}]. Reading
+  // that as a bare object loses every field and mislabels it "端点不存在,
+  // 请检查 Base URL" — pointing at the one thing that was already correct.
+  const error = await expectProviderError(translate("google_model_not_found"), {
+    status: 404, code: "model_not_found"
+  });
+  assert.match(error.remoteMessage, /is not found/);
+});
+
+test("an array-wrapped quota error keeps its gateway message", async () => {
+  const error = await expectProviderError(translate("google_quota"), {
+    status: 429, code: "rate_limited"
+  });
+  assert.match(error.remoteMessage, /Quota exceeded/);
+  assert.match(error.remoteMessage, /limit: 5/);
+  // Google sends no Retry-After header, so the panel falls back to its own
+  // cooldown rather than reading a wait out of thin air.
+  assert.equal(error.retryAfterMs, null);
+});
+
+test("an array-wrapped 400 surfaces the reason instead of a bare parameter error", async () => {
+  const badKey = await expectProviderError(translate("google_bad_key"), { status: 400 });
+  assert.match(badKey.remoteMessage, /valid API key/);
+
+  mock.reset();
+  const unknownField = await expectProviderError(translate("google_unknown_field"), { status: 400 });
+  assert.match(unknownField.remoteMessage, /Unknown name "thinking"/);
+});
+
+test("an array-wrapped rejection still drives capability degradation", async () => {
+  // The rejected field is named only inside the message, inside the array.
+  const result = await translate("google_reject_response_format");
+  assert.ok(result.english);
+  assert.equal(chatRequests().length, 2);
+  assert.equal(result.capabilityPatch.jsonMode, false);
+  assert.equal(chatRequests()[1].body.response_format, undefined);
+});
+
+test("an array-wrapped error delivered with HTTP 200 is still a logical error", async () => {
+  await expectProviderError(translate("google_logical_200"), {
+    status: 200, code: "logical_api_error"
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Misconfiguration: fail before spending money
 // ---------------------------------------------------------------------------
 

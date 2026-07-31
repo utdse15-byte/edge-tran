@@ -26,7 +26,7 @@ globalThis.fetch = async () => new Response(JSON.stringify({ choices: [...] }), 
 
 | 层 | 载体 | 覆盖 |
 | --- | --- | --- |
-| 传输/翻译管线 | `tests/e2e-provider.test.js`（99 项，`npm test`） | `lib/translator.js` + `lib/provider.js` 直接打真实 socket |
+| 传输/翻译管线 | `tests/e2e-provider.test.js`（104 项，`npm test`） | `lib/translator.js` + `lib/provider.js` 直接打真实 socket |
 | 真实 UI 全链路 | `scripts/panel-live-provider-test.py`（`npm run verify:full`） | Chromium 里跑真实 `panel.js` → 真实 HTTP → 真实 writer 链路 |
 | 人工联调 | `npm run mock:provider` | 侧载真实扩展，Base URL 指向本地网关（见 TESTING.md 场景表） |
 
@@ -43,14 +43,15 @@ globalThis.fetch = async () => new Response(JSON.stringify({ choices: [...] }), 
 | 5 | 标错 `text/event-stream` 的 JSON 响应白白失败 | 低 | 对所有响应一律标 SSE 的网关；正文其实已在内存里 | `/sse_content_type_json_body/v1` |
 | 6 | 丢失的流式事件被算到模型头上 | 中 | 中间丢一个 delta，流仍以 `finish_reason: stop` 收尾 → 报"模型可能复述了原稿"并多花一次修复请求 | `/sse_dropped_event/v1` |
 | 7 | 信息性状态覆盖掉更新更重要的错误 | 低 | 另一窗口清除/轮换 Key 的同时用户点翻译：错误被"已采纳另一个窗口的配置修改，自动流程继续"盖掉，状态栏与实际结果不符 | 见 panel-live-provider 步骤 5m |
+| 8 | 数组包裹的错误体使错误信息整体失效 | 高 | Google AI Studio 兼容层把每个错误包成 `[{error:{…}}]`：模型 ID 写错被报成"端点不存在"、网关消息全丢、兼容降级永不触发 | `/google_model_not_found/v1` 等 5 个场景 |
 
 配套的工程问题（同样修复）：
 
 | # | 问题 | 影响 |
 | --- | --- | --- |
-| 7 | `npm run check` 只检查 `.js`，`.mjs` 整体跳过 | `scripts/audit.mjs` 自己从未被语法检查 |
-| 8 | 4 个浏览器套件中 2 个把 Chromium 路径硬编码为 `/usr/bin/chromium` | 非 Debian 环境 `npm run verify:full` 直接跑不起来 |
-| 9 | `TranslationValidationError` 的 errors 不去重 | 用户会看到"模型返回的 back_translation为空；…；模型返回的 back_translation为空" |
+| E1 | `npm run check` 只检查 `.js`，`.mjs` 整体跳过 | `scripts/audit.mjs` 自己从未被语法检查 |
+| E2 | 4 个浏览器套件中 2 个把 Chromium 路径硬编码为 `/usr/bin/chromium` | 非 Debian 环境 `npm run verify:full` 直接跑不起来 |
+| E3 | `TranslationValidationError` 的 errors 不去重 | 用户会看到"模型返回的 back_translation为空；…；模型返回的 back_translation为空" |
 
 第 6 项的修复自身带一个陷阱，已一并处理：`[DONE]` 以 `[` 开头，若把 `data: [DONE] `（带尾随空白）送进 JSON 解析路径，就会被判成丢包。终止符改用 trim 比较，并加了回归测试。
 
@@ -80,11 +81,17 @@ globalThis.fetch = async () => new Response(JSON.stringify({ choices: [...] }), 
 4. **24 小时限流冷却没有界面内取消入口**。逃生路径是重新保存 Provider 设置或重开侧栏，但不可发现。建议在状态栏加一个显式"结束冷却"操作。
 5. ~~`testTranslationConnection` 吞掉非 ProviderError 的原因~~ —— 本轮已修（保留为"连接测试失败：…"）。核实过程中顺带确认：受保护片段超过 1000 个这条路径在连通测试里其实**不可达**（测试用的原文固定且很短，最多只有十几个非重叠片段）；真正可达的是鉴权 Header 名非法、鉴权前缀含非 Latin-1 字符这类 `buildHeaders` 预检失败，回归测试按可达路径写。
 6. **Responses 只返回 `output_text`** 的网关被拒绝（0.2.7 起的严格策略）。如果实际遇到这类中转站，需要一次显式的取舍决策，而不是悄悄放宽。
+7. **Google AI Studio 实测补充**（真实 Key 联调，`https://generativelanguage.googleapis.com/v1beta/openai`）：
+   - 走 Chat Completions 协议**可用**；`/responses` 返回 404（该兼容层没有这个路由），错误文案已正确提示切换协议。
+   - 免费档是 **5 RPM**（`gemini-3.5-flash`，错误体原文 `limit: 5`），不是无限量；429 不带 `Retry-After` 头，只在正文里写"Please retry in 4.68s"，插件按默认 15 秒冷却。
+   - 兼容层 `/models` **列不出 `gemini-3.5-flash`**（59 个模型里没有），必须手填模型 ID。
+   - 流式确实是流式，但只有 3 个内容分片、约 92ms 内到齐（思考耗时在前），流式预览的体感收益接近于零；且默认不回传 usage。实测 `stream_options:{include_usage:true}` **受支持**且能拿到 usage——但插件不主动发送该字段（未知网关若拒绝它会被归入 `stream` 降级、直接关掉流式，代价大于收益），因此 Gemini + 流式时用量为空。
+   - 同请求回译档下 Gemini 常把 `back_translation` 原样抄回中文原稿，触发既有的"回译与中文原稿几乎完全相同"提醒——该提醒按设计工作。
 
 ## 如何重跑
 
 ```
-npm run verify        # 语法（含 .mjs）+ 191 项 Node 测试 + 静态审计
+npm run verify        # 语法（含 .mjs）+ 196 项 Node 测试 + 静态审计
 npm run verify:full   # 追加 5 个 Chromium 套件（含 panel-live-provider）
 npm run mock:provider # 人工联调：把扩展 Base URL 指向 http://127.0.0.1:8787/<scenario>/v1
 ```

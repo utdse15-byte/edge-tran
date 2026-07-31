@@ -1293,6 +1293,66 @@ scenario("raw", (ctx) => {
   ctx.res.end(body);
 });
 
+// -- Google AI Studio OpenAI-compatibility layer ----------------------------
+//
+// Verified against the real endpoint: every error is wrapped in a one-element
+// JSON array, error.code is a number, there is no error.param, the auth
+// failure is a 400 rather than a 401, and 429 carries no Retry-After header.
+
+function googleError(res, status, message, extra = {}) {
+  const body = Buffer.from(JSON.stringify([{
+    error: { code: status, message, status: extra.status ?? "INVALID_ARGUMENT" }
+  }]), "utf8");
+  res.writeHead(status, {
+    "Content-Type": "application/json; charset=UTF-8",
+    "Content-Length": String(body.byteLength),
+    ...CORS_HEADERS
+  });
+  res.end(body);
+}
+
+scenario("google_model_not_found", (ctx) => googleError(
+  ctx.res, 404,
+  "models/gemini-does-not-exist is not found for API version v1main, or is not supported for generateContent. "
+  + "Call ModelService.ListModels to see the list of available models and their supported methods.",
+  { status: "NOT_FOUND" }
+));
+
+scenario("google_quota", (ctx) => googleError(
+  ctx.res, 429,
+  "You exceeded your current quota, please check your plan and billing details. "
+  + "* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, "
+  + "limit: 5, model: gemini-3.5-flash Please retry in 4.686262257s.",
+  { status: "RESOURCE_EXHAUSTED" }
+));
+
+scenario("google_bad_key", (ctx) => googleError(ctx.res, 400, "Please pass a valid API key."));
+
+scenario("google_unknown_field", (ctx) => googleError(
+  ctx.res, 400, 'Invalid JSON payload received. Unknown name "thinking": Cannot find field.'
+));
+
+scenario("google_reject_response_format", (ctx) => {
+  // Hypothetical but shaped exactly like the real 400s: the rejected field is
+  // named only in the message, inside the array envelope.
+  if (ctx.body.response_format) {
+    return googleError(ctx.res, 400, 'Invalid JSON payload received. Unknown name "response_format": Cannot find field, this parameter is not supported.');
+  }
+  return ok(ctx);
+});
+
+scenario("google_logical_200", (ctx) => {
+  const body = Buffer.from(JSON.stringify([{
+    error: { code: 500, message: "Internal error encountered.", status: "INTERNAL" }
+  }]), "utf8");
+  ctx.res.writeHead(200, {
+    "Content-Type": "application/json",
+    "Content-Length": String(body.byteLength),
+    ...CORS_HEADERS
+  });
+  ctx.res.end(body);
+});
+
 // -- /models variants -------------------------------------------------------
 
 scenario("models_missing", (ctx) => {

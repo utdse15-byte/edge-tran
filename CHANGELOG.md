@@ -2,7 +2,7 @@
 
 ## 0.2.14 — 2026-07-30
 
-真实网关联调修复版。此前所有 Provider 测试都靠替换 `globalThis.fetch` 用手写 `Response` 断言,**从未经过真实 HTTP 传输**:分块传输、跨 TCP 包切断的 SSE 事件、切在多字节字符中间的 UTF-8、内容协商、Content-Encoding、重定向、僵死连接、以及"客户端取消流服务端是否感知"全部在覆盖范围之外。本版新增一个自带的 OpenAI 兼容网关模拟器(`scripts/mock-provider.mjs`,112 个场景),让扩展在真实 socket 上跑起来,由此定位并修复 6 个传输层缺陷,以及 1 个状态栏竞态。
+真实网关联调修复版。此前所有 Provider 测试都靠替换 `globalThis.fetch` 用手写 `Response` 断言,**从未经过真实 HTTP 传输**:分块传输、跨 TCP 包切断的 SSE 事件、切在多字节字符中间的 UTF-8、内容协商、Content-Encoding、重定向、僵死连接、以及"客户端取消流服务端是否感知"全部在覆盖范围之外。本版新增一个自带的 OpenAI 兼容网关模拟器(`scripts/mock-provider.mjs`,112 个场景),让扩展在真实 socket 上跑起来,由此定位并修复 6 个传输层缺陷,以及 1 个状态栏竞态、1 个数组包裹错误体缺陷。
 
 ### ① 流式请求的 Accept 头不正确(修复)
 
@@ -37,7 +37,7 @@
 ### 工具与测试
 
 - **新增 `scripts/mock-provider.mjs`**:零依赖的 OpenAI 兼容网关模拟器,实现 `/v1/chat/completions`(缓冲 + SSE)、`/v1/responses`(缓冲 + SSE)、`/v1/models`,内置确定性词典翻译模型(遵守 english / back_translation / corrections / ambiguous 契约与占位符规则)。112 个场景各自是一个 Base URL(`http://127.0.0.1:8787/<scenario>/v1`):限流、5xx、nginx HTML、登录页、GBK、gzip、BOM、重定向、socket reset、僵死流、逐字节 SSE、切在多字节字符中间、CRLF + 注释心跳、pretty-print 多行 data、丢事件、超限响应、逐项参数拒绝、思考字段拒绝、协议错配、占位符破坏、越界纠错……`npm run mock:provider` 可直接给真实扩展当本地网关手动联调。
-- **新增 `tests/e2e-provider.test.js`(99 项)**:全部经真实 socket 驱动 `lib/translator.js` + `lib/provider.js`。
+- **新增 `tests/e2e-provider.test.js`(104 项)**:全部经真实 socket 驱动 `lib/translator.js` + `lib/provider.js`。
 - **新增 `scripts/panel-live-provider-test.py`**:Chromium 里跑真实 `panel.js`,通过真实 HTTP 打到本地网关,再经真实 writer 链路写入。覆盖流式预览增量落到 UI、限流不写入、丢包文案不冤枉模型、运行期降级不被持久化、SSE 路由故障的连通测试诊断、评审提醒渲染、模型探测,以及**计费行为**:连打一串键只产生 1 次付费请求、重复翻译同一稿 +0、只加尾随空格 +0(服务端计数核对)。
 - `npm run check` 此前只检查 `.js`,`.mjs` 被整体跳过(包括 `scripts/audit.mjs` 自己);现已纳入。
 - 四个浏览器套件里有两个把 Chromium 路径硬编码成 `/usr/bin/chromium`,`CHROMIUM_PATH` 只在另外两个生效——非 Debian 环境下 `verify:full` 直接跑不起来。现已统一支持环境变量并自动探测常见路径。
@@ -58,6 +58,21 @@
 
 - `scheduleExternalConfigurationReload` 有 80ms 防抖、之后还要 `await` 一次存储读取。用户完全可以在这个窗口里做事——比如另一个 Edge 窗口刚清除/轮换了 Key,当前窗口点"翻译并同步"得到"请先配置 API Key"。此时那条**纯信息性**的"已采纳另一个窗口的配置修改,自动流程继续"随后落地,把错误状态整条盖掉:状态栏宣称自动流程在继续,实际这次翻译已经中止,唯一线索只剩设置弹窗被打开了。同一个窗口里的限流冷却提示、写入事故提示也会被同样盖掉。
 - 修复:`setStatus` 增加单调计数器;外部配置通知在**排期时刻**取快照,落地时若发现期间有更新的状态就不再覆盖(采纳事实照旧写入诊断日志,信息不丢)。重新读取失败那条 `error` 状态仍然无条件生效——它伴随暂停,属于必须让用户看到的。
+
+### ⑧ 数组包裹的错误响应体导致整套错误信息失效(修复)
+
+用真实的 Google AI Studio OpenAI 兼容端点(`https://generativelanguage.googleapis.com/v1beta/openai`)联调时发现:该网关把**每一个**错误都包在一个单元素 JSON 数组里——`[{"error":{"code":404,"message":"models/… is not found …"}}]`,而且 `error.code` 是数字、没有 `error.param`、Key 无效返回 400 而非 401、429 不带 `Retry-After` 头。
+
+按对象读取时 `error.code` / `error.param` / `error.message` 全是 `undefined`,连锁后果:
+
+- **模型 ID 写错被报成"端点不存在,请检查 Base URL"**——把用户支到唯一没错的地方去改。兼容层的 `/models` 还查不到 `gemini-3.5-flash`(必须手填),所以这条路径很容易踩到。
+- 网关自己那句最有用的话全被丢弃(配额还剩多少、哪个参数非法、"Please pass a valid API key")。
+- **兼容降级永远不可能触发**:`unsupportedFields` 来自 `error.param`/`error.message`,两者皆空 → `compatibilityHint` 恒为 false。
+- 思考参数被拒同样识别不到,退化成笼统的参数不兼容。
+
+修复:新增 `unwrapErrorEnvelope`,对数组包裹的错误信封取出第一个带 `error` 的元素(HTTP 200 携带同款信封时一并处理)。顺带修正两处配套问题:模型失败识别的 `\bmodel\b` 放宽为 `\bmodels?\b`(Google 说的是"**models**/x is not found",单数匹配不上);`incompatible_request` 的文案补上网关消息摘录——Google 对无效 Key 返回的是 400 而不是 401,不带上那句"Please pass a valid API key"用户根本无从判断。
+
+真实端点复验:改后"模型 ID 写错"正确归类为 `model_not_found` 并带出 Google 原文;正常翻译、占位符保全、流式预览均正常。
 
 ### 复核确认无问题的行为(不改动)
 
